@@ -4,6 +4,29 @@
 
 **安全边界：没有鉴权，也没有加密。任何能连接该回环端口的本机进程，都能以 broker 用户的权限执行任意命令。共享 endpoint 也不能认证服务身份。仅在可信开发设备上主动启动，使用完关闭；不要以 root 运行，不要用于公共、多租户或无人值守环境。随机端口不是安全措施。**
 
+## 安装
+
+通过 [oheco 软件目录](https://oheco.org/) 安装：
+
+```sh
+oo update
+oo install oheco-broker
+oheco-broker --version
+```
+
+也可从 [GitHub Releases](https://github.com/oheco/oheco-broker/releases) 下载 `ohos-arm64` 发行包，并使用随附 `SHA256SUMS` 校验。包内 `bin/oheco-broker` 已签名，运行只依赖系统 `libc.so`，不需要安装 Go 或 .NET；所执行的工具由使用者另行安装。
+
+发行包同时包含完整源码及两套 SDK。使用 `oo` 默认安装目录时，源码 SDK 位于：
+
+```text
+~/.oheco/packages/oheco-broker/0.1.0/sdk/c/
+~/.oheco/packages/oheco-broker/0.1.0/sdk/dotnet/
+```
+
+自定义 `OHECO_ROOT` 时替换上述 `~/.oheco`。C 项目编译 `.c` 并包含 `.h`；C# 项目用 `ProjectReference` 引用 SDK 项目，或直接编译 `BrokerProcess.cs`。无需独立原生 SDK 库。
+
+安装不会启动服务，不修改自启动配置；`oheco-broker@0.1.0` 可使用指定版本入口。
+
 ## 使用
 
 在具备工具执行能力的终端中运行：
@@ -76,6 +99,20 @@ sh scripts/test.sh
 当前鸿蒙原生验收、工具链版本、真实 `dotnet build` 结果及限制见 [VALIDATION.md](VALIDATION.md)。
 
 仅实现 Unix/POSIX 服务端，首要验收目标为 HarmonyOS/OpenHarmony arm64。其他平台不应视为已验证。鸿蒙中的应用到回环 TCP 的访问仍依赖应用权限和系统版本；终端侧 SDK 验证不能替代真实应用的跨沙箱集成验证。
+
+## 发行构建
+
+在干净且已提交的鸿蒙原生 checkout 中执行：
+
+```sh
+sh scripts/test.sh
+python3 scripts/package.py
+python3 tests/release_smoke.py dist/oheco-broker-0.1.0-ohos-arm64.tar.gz
+```
+
+打包脚本从当前 Git 提交导出源码，在私有临时目录编译、签名并生成 `dist/` 下的压缩包、校验和及构建日志，不自动创建标签或发布。归档包含 `BUILDINFO.txt`（源码提交、工具链、二进制摘要）及 Go 运行时代码许可证。已存在的同名归档不会被覆盖。发布烟测会迁移到含空格和 Unicode 的目录，验证服务执行、SDK 文件、版本入口和真实 GitHub 上游访问；外网访问固定使用当前开发环境的 SOCKS5 代理。
+
+完成上述验证后才能创建对应标签/Release，并更新 `oheco-packages`；正式发布的产物保持不可变。初版说明见 [v0.1.0](docs/releases/v0.1.0.md)。
 
 ## 不包含
 

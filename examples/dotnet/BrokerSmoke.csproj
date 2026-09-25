@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <NuGetAudit>false</NuGetAudit>
+    <RestoreSources></RestoreSources>
+    <RestoreIgnoreFailedSources>true</RestoreIgnoreFailedSources>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(UseBrokerSource)' != 'true'">
+    <ProjectReference Include="../../sdk/dotnet/Oheco.Broker.csproj" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(UseBrokerSource)' == 'true'">
+    <Compile Include="../../sdk/dotnet/BrokerProcess.cs" Link="Oheco.Broker/BrokerProcess.cs" />
+  </ItemGroup>
+</Project>

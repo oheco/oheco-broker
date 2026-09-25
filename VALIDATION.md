@@ -25,7 +25,7 @@ PASS Go + C + .NET + real dotnet build; endpoint cleaned
 
 Covered:
 
-- Go tests and `go vet`: request codec, invalid/truncated input, discovery lock/publish/cleanup, binary stdin/stdout/stderr, nonzero exit, 2.6 MiB on each output stream, arguments/cwd/environment, spawn failure, cancellation escalation, disconnect and service shutdown child cleanup.
+- Go tests and `go vet`: request codec, invalid/truncated input, discovery lock/publish/cleanup, binary stdin/stdout/stderr, nonzero exit, 2.5 MiB on each output stream, arguments/cwd/environment, spawn failure, cancellation escalation, disconnect and service shutdown child cleanup.
 - C: strict C11 compile/link with `-Wall -Wextra -Werror -pthread`; malformed discovery/refused connection => UNAVAILABLE; fragmented frames and resuming timed-out partial reads; protocol type/order/size/UTF-8/EXIT rejection; server errors; connection loss; bounded handshake/start deadlines.
 - C live SDK: streams, stdin/EOF, Unicode arguments/environment/cwd, large output, draining waits, noncancelling wait timeout, concurrent output/cancel, bounded blocked-input cancellation.
 - .NET: dependency-free ProjectReference and include-source builds, zero warnings/errors; discovery/protocol errors, bounded buffer overflow, real broker streams/EOF/events, spawn errors, waits and cancellation.

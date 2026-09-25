@@ -11,6 +11,7 @@ import (
 )
 
 const Magic = "OHECOB1\n"
+const MagicV2 = "OHECOB2\n"
 const MaxFrame = 1 << 20
 const MaxChunk = 65536
 const MaxItems = 4096
@@ -25,6 +26,8 @@ const (
 	Cancel
 	Exit
 	Error
+	StartDetached
+	DetachedStarted
 )
 const (
 	OK uint32 = iota
@@ -135,8 +138,7 @@ func (d *decoder) count() int {
 	return int(n)
 }
 
-func DecodeStart(p []byte) (Request, error) {
-	d := decoder{b: p}
+func decodeStart(d *decoder) (Request, error) {
 	r := Request{Executable: d.str(), Cwd: d.str()}
 	argc := d.count()
 	for i := 0; i < argc && d.err == nil; i++ {
@@ -158,11 +160,50 @@ func DecodeStart(p []byte) (Request, error) {
 	if r.Executable == "" {
 		return Request{}, errors.New("executable is empty")
 	}
-	if len(d.b) != 1 || d.b[0] > 1 {
-		return Request{}, errors.New("invalid stdin flag or trailing bytes")
+	if len(d.b) < 1 || d.b[0] > 1 {
+		return Request{}, errors.New("invalid stdin flag")
 	}
 	r.Stdin = d.b[0] == 1
+	d.b = d.b[1:]
 	return r, nil
+}
+
+func DecodeStart(p []byte) (Request, error) {
+	d := decoder{b: p}
+	r, err := decodeStart(&d)
+	if err == nil && len(d.b) != 0 {
+		err = errors.New("trailing START bytes")
+	}
+	return r, err
+}
+
+type DetachedRequest struct {
+	Request
+	StdoutFile, StderrFile string
+}
+
+func DecodeDetached(p []byte) (DetachedRequest, error) {
+	d := decoder{b: p}
+	r, err := decodeStart(&d)
+	if err != nil {
+		return DetachedRequest{}, err
+	}
+	if r.Stdin {
+		return DetachedRequest{}, errors.New("detached stdin must be disabled")
+	}
+	out, errout := d.str(), d.str()
+	if d.err != nil {
+		return DetachedRequest{}, d.err
+	}
+	if len(d.b) != 0 {
+		return DetachedRequest{}, errors.New("trailing detached START bytes")
+	}
+	return DetachedRequest{r, out, errout}, nil
+}
+func EncodeDetached(r DetachedRequest) []byte {
+	b := EncodeStart(r.Request)
+	b = AppendString(b, r.StdoutFile)
+	return AppendString(b, r.StderrFile)
 }
 func AppendU32(b []byte, n uint32) []byte { return binary.BigEndian.AppendUint32(b, n) }
 func AppendString(b []byte, s string) []byte {

@@ -1,8 +1,8 @@
 #!/usr/bin/sh
-# Invoke from anywhere: sh examples/dotnet/test.sh /explicit/endpoint [--protocol-only]
+# Invoke from anywhere: sh examples/dotnet/test.sh /explicit/endpoint [--protocol-only|--managed-only]
 set -eu
 if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
-    printf '%s\n' 'Usage: sh test.sh /explicit/broker/endpoint [--protocol-only]' >&2
+    printf '%s\n' 'Usage: sh test.sh /explicit/broker/endpoint [--protocol-only|--managed-only]' >&2
     exit 2
 fi
 : "${TMPDIR:?TMPDIR must identify a writable temporary directory}"
@@ -11,7 +11,8 @@ priv=$(mktemp -d "${TMPDIR%/}/broker-dotnet.XXXXXX")
 trap 'rm -rf "$priv"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-mkdir -p "$priv/feed" "$priv/home" "$priv/packages"
+mkdir -p "$priv/feed" "$priv/home" "$priv/packages" "$priv/tmp"
+export TMPDIR="$priv/tmp"
 export DOTNET_CLI_HOME="$priv/home"
 export DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
 export DOTNET_CLI_TELEMETRY_OPTOUT=1

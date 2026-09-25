@@ -55,6 +55,42 @@ func TestFraming(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+func TestDetachedCodec(t *testing.T) {
+	r := DetachedRequest{Request: Request{Executable: "x", Args: []string{"", "中文"}}, StdoutFile: "a b/输出", StderrFile: ""}
+	encoded := EncodeDetached(r)
+	got, err := DecodeDetached(encoded)
+	if err != nil || got.StdoutFile != r.StdoutFile || got.Args[1] != "中文" {
+		t.Fatal(got, err)
+	}
+	for i := 0; i < len(encoded); i++ {
+		if _, err := DecodeDetached(encoded[:i]); err == nil {
+			t.Fatalf("accepted truncation %d", i)
+		}
+	}
+	if _, err := DecodeStart(encoded); err == nil {
+		t.Fatal("v1 accepted v2 trailing fields")
+	}
+	if _, err := DecodeDetached(append(encoded, 0)); err == nil {
+		t.Fatal("accepted trailing bytes")
+	}
+	r.Stdin = true
+	if _, err := DecodeDetached(EncodeDetached(r)); err == nil {
+		t.Fatal("accepted detached stdin")
+	}
+	r.Stdin = false
+	r.StdoutFile = "x\x00y"
+	if _, err := DecodeDetached(EncodeDetached(r)); err == nil {
+		t.Fatal("accepted NUL path")
+	}
+}
+func FuzzDecodeDetached(f *testing.F) {
+	f.Add(EncodeDetached(DetachedRequest{Request: Request{Executable: "x"}}))
+	f.Fuzz(func(t *testing.T, b []byte) {
+		if len(b) <= MaxFrame {
+			_, _ = DecodeDetached(b)
+		}
+	})
+}
 func FuzzDecodeStart(f *testing.F) {
 	f.Add(EncodeStart(Request{Executable: "dotnet", Args: []string{"--version"}}))
 	f.Fuzz(func(t *testing.T, b []byte) {

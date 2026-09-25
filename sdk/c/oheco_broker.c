@@ -103,10 +103,13 @@ static ob_error size_string(const char *s, size_t *total) {
     *total += 4 + n;
     return OB_OK;
 }
-static ob_error encode_start(const ob_options *o, unsigned char **payload, size_t *size) {
+static ob_error encode_start(const ob_options *o, int detached,
+                             const char *stdout_file, const char *stderr_file,
+                             unsigned char **payload, size_t *size) {
     if (!o || !o->executable || !*o->executable || o->argc > 4096 || o->envc > 4096 ||
         (o->argc && !o->args) || (o->envc && !o->env) ||
-        (o->stdin_enabled != 0 && o->stdin_enabled != 1)) return OB_INVALID_ARGUMENT;
+        (o->stdin_enabled != 0 && o->stdin_enabled != 1) ||
+        (detached && o->stdin_enabled)) return OB_INVALID_ARGUMENT;
     const char *cwd = o->cwd ? o->cwd : "";
     size_t n = 9;
     ob_error e = size_string(o->executable, &n);
@@ -119,6 +122,8 @@ static ob_error encode_start(const ob_options *o, unsigned char **payload, size_
         e = size_string(o->env[i].key, &n);
         if (!e) e = size_string(o->env[i].value, &n);
     }
+    if (!e && detached) e = size_string(stdout_file, &n);
+    if (!e && detached) e = size_string(stderr_file, &n);
     if (e) return e;
     unsigned char *b = malloc(n), *p;
     if (!b) return OB_IO;
@@ -129,7 +134,9 @@ static ob_error encode_start(const ob_options *o, unsigned char **payload, size_
     for (size_t i = 0; i < o->envc; i++) {
         p = put_string(p, o->env[i].key); p = put_string(p, o->env[i].value);
     }
-    *p = (unsigned char)o->stdin_enabled; *payload = b; *size = n;
+    *p++ = (unsigned char)o->stdin_enabled;
+    if (detached) { p = put_string(p, stdout_file); (void)put_string(p, stderr_file); }
+    *payload = b; *size = n;
     return OB_OK;
 }
 
@@ -214,7 +221,8 @@ static ob_error receive_frame(ob_process *p, int64_t end, int starting, ob_diagn
         p->payload_size = get32(p->header + 1);
         unsigned t = p->header[0]; size_t n = p->payload_size;
         int valid = n <= OB_MAX_FRAME &&
-            ((t == 9 && n >= 8) || (starting && t == 2 && n == 0) ||
+            ((t == 9 && n >= 8) || (starting == 1 && t == 2 && n == 0) ||
+             (starting == 2 && t == 11 && n == 4) ||
              (!starting && ((t == 8 && n == 12) || ((t == 5 || t == 6) && n >= 1 && n <= OB_MAX_STREAM))));
         if (!valid) return diag(d, poison(p, OB_PROTOCOL), "frame", 0, "Invalid frame type, order or size");
         p->payload = malloc(n ? n : 1);
@@ -278,12 +286,13 @@ static int discover(const char *path, unsigned *port) {
     *port = value; return 0;
 }
 
-ob_error ob_start(const char *endpoint_file, const ob_options *o,
-                  ob_process **out, ob_diagnostic *d) {
-    if (!out) return diag(d, OB_INVALID_ARGUMENT, "start", 0, "Missing result pointer");
+/* A detached exchange borrows the same transport/framing, never exposes a handle. */
+static ob_error start_exchange(const char *endpoint_file, const ob_options *o,
+                               int detached, const char *stdout_file, const char *stderr_file,
+                               ob_process **out, ob_diagnostic *d) {
     *out = NULL;
     unsigned char *payload = NULL; size_t size = 0;
-    ob_error e = encode_start(o, &payload, &size);
+    ob_error e = encode_start(o, detached, stdout_file, stderr_file, &payload, &size);
     if (e) return diag(d, e, "options", 0, "Invalid options, invalid UTF-8 or oversized START");
     unsigned port = 0; int rc = discover(endpoint_file, &port);
     if (rc) { free(payload); return diag(d, OB_UNAVAILABLE, "discovery", rc, "Endpoint file unavailable or malformed"); }
@@ -310,20 +319,50 @@ ob_error ob_start(const char *endpoint_file, const ob_options *o,
         if (rc) { e = diag(d, OB_UNAVAILABLE, "connect", rc, "Broker connection failed"); goto fail; }
     }
     end = deadline(OB_DEADLINE);
-    static const unsigned char magic[] = "OHECOB1\n";
+    const unsigned char *magic = (const unsigned char *)(detached ? "OHECOB2\n" : "OHECOB1\n");
     unsigned char response[8]; size_t have = 0;
     rc = send_bytes(p, magic, 8, end, 0);
     if (!rc) rc = recv_bytes(p, response, 8, &have, end);
     if (rc || memcmp(magic, response, 8)) { e = diag(d, OB_PROTOCOL, "handshake", rc, "Handshake failed"); goto fail; }
     end = deadline(OB_DEADLINE);
-    rc = send_frame(p, 1, payload, size, end, 0);
+    rc = send_frame(p, detached ? 10 : 1, payload, size, end, 0);
     if (rc) { e = diag(d, rc == ETIMEDOUT ? OB_TIMEOUT : OB_CONNECTION_LOST, "start", rc, "START send failed; outcome may be unknown"); goto fail; }
-    e = receive_frame(p, end, 1, d);
-    if (e) goto fail;
-    clear_frame(p); p->stdin_open = o->stdin_enabled;
+    e = receive_frame(p, end, detached ? 2 : 1, d);
+    if (e) {
+        if (detached && e == OB_TIMEOUT && !atomic_load(&p->failure))
+            diag(d, e, "start", ETIMEDOUT, "Detached START deadline expired; outcome unknown; do not retry");
+        goto fail;
+    }
+    if (!detached) clear_frame(p);
+    p->stdin_open = o->stdin_enabled;
     free(payload); *out = p; return diag(d, OB_OK, "start", 0, "");
 fail:
     free(payload); ob_release(p); return e;
+}
+
+ob_error ob_start(const char *endpoint_file, const ob_options *o,
+                  ob_process **out, ob_diagnostic *d) {
+    if (!out) return diag(d, OB_INVALID_ARGUMENT, "start", 0, "Missing result pointer");
+    return start_exchange(endpoint_file, o, 0, NULL, NULL, out, d);
+}
+
+ob_error ob_spawn_detached(const char *endpoint_file, const ob_options *o,
+                           const char *stdout_file, const char *stderr_file,
+                           uint32_t *pid, ob_diagnostic *d) {
+    if (!pid) return diag(d, OB_INVALID_ARGUMENT, "start", 0, "Missing PID pointer");
+    *pid = 0;
+    ob_process *p = NULL;
+    ob_error e = start_exchange(endpoint_file, o, 1,
+                                stdout_file ? stdout_file : "",
+                                stderr_file ? stderr_file : "", &p, d);
+    if (e) return e;
+    uint32_t value = get32(p->payload);
+    if (!value || value > INT32_MAX)
+        e = diag(d, OB_PROTOCOL, "start", 0, "Invalid detached PID");
+    else *pid = value;
+    /* Close immediately after ACK; no EOF wait, CANCEL, or managed fallback. */
+    ob_release(p);
+    return e;
 }
 
 static ob_error input(ob_process *p, const void *data, size_t size, int eof, ob_diagnostic *d) {

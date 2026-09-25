@@ -1,4 +1,4 @@
-// Pure managed protocol v1 client. This file can also be included as source.
+// Pure managed v1 command / v2 detached client. This file can also be included as source.
 #nullable enable
 using System;
 using System.Buffers.Binary;
@@ -64,6 +64,7 @@ public sealed class BrokerProcess : IDisposable
 {
     private const int MaxFrame = 1048576;
     private static readonly byte[] Magic = Encoding.ASCII.GetBytes("OHECOB1\n");
+    private static readonly byte[] DetachedMagic = Encoding.ASCII.GetBytes("OHECOB2\n");
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
     private readonly object sync = new();
     private readonly SemaphoreSlim sendLock = new(1, 1);
@@ -112,6 +113,32 @@ public sealed class BrokerProcess : IDisposable
 
     public bool Start() { StartAsync().GetAwaiter().GetResult(); return true; }
 
+    /// <summary>Starts a detached command and returns only its diagnostic PID, not a wait/cancel handle.</summary>
+    public static int SpawnDetached(BrokerProcessStartInfo info, string? stdoutFile = null,
+        string? stderrFile = null, CancellationToken cancellationToken = default) =>
+        SpawnDetachedAsync(info, stdoutFile, stderrFile, cancellationToken).GetAwaiter().GetResult();
+
+    /// <summary>
+    /// Uses v2 without fallback or retry. All redirect flags must be false. Log files
+    /// are appended; null/empty paths mean /dev/null. A failed acknowledgement may
+    /// leave a running command; closing this connection never kills a committed spawn.
+    /// </summary>
+    public static async Task<int> SpawnDetachedAsync(BrokerProcessStartInfo info, string? stdoutFile = null,
+        string? stderrFile = null, CancellationToken cancellationToken = default)
+    {
+        // Reuse the managed client's private encoding and startup transport, but never
+        // expose an instance, activate streams, or send input/CANCEL for detached work.
+        using var request = new BrokerProcess(info);
+        byte[] payload;
+        try { payload = request.EncodeStart(true, stdoutFile, stderrFile); }
+        catch (Exception ex) when (ex is not BrokerException)
+        { throw Wrap(BrokerErrorCode.InvalidArgument, "arguments", ex); }
+        byte[] reply = await request.StartRequestAsync(payload, true, cancellationToken).ConfigureAwait(false);
+        uint pid = BinaryPrimitives.ReadUInt32BigEndian(reply);
+        if (pid is 0 or > int.MaxValue) throw Protocol("Invalid detached PID.");
+        return (int)pid;
+    }
+
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
         lock (sync)
@@ -119,8 +146,7 @@ public sealed class BrokerProcess : IDisposable
             if (disposed || attempted) throw Invalid("An instance can start exactly once, and cannot start after Dispose.");
             attempted = true;
         }
-        bool sentStart = false;
-        string stage = "arguments";
+        bool acknowledged = false;
         try
         {
             byte[] payload = EncodeStart();
@@ -136,31 +162,8 @@ public sealed class BrokerProcess : IDisposable
                 errorBuffer = new BoundedReadStream(StartInfo.OutputBufferBytes);
                 error = new StreamReader(errorBuffer, Encoding.UTF8, false, 4096);
             }
-            stage = "endpoint";
-            int port = ReadEndpoint(StartInfo.EndpointFile);
-            client = new TcpClient(AddressFamily.InterNetwork) { NoDelay = true };
-            stage = "connect";
-            using (var deadline = Deadline(cancellationToken, 3))
-                await client.ConnectAsync(IPAddress.Loopback, port, deadline.Token).ConfigureAwait(false);
-            wire = client.GetStream();
-            stage = "handshake";
-            using (var deadline = Deadline(cancellationToken, 3))
-            {
-                await wire.WriteAsync(Magic, deadline.Token).ConfigureAwait(false);
-                byte[] reply = new byte[Magic.Length];
-                await ReadExactlyAsync(reply, deadline.Token).ConfigureAwait(false);
-                if (!reply.AsSpan().SequenceEqual(Magic)) throw Protocol("Invalid handshake.");
-            }
-            stage = "start";
-            using (var deadline = Deadline(cancellationToken, 3))
-            {
-                // Once a START write is attempted, a transport failure has an unknown outcome.
-                sentStart = true;
-                await WriteFrameAsync(1, payload, deadline.Token).ConfigureAwait(false);
-                var frame = await ReadFrameAsync(deadline.Token).ConfigureAwait(false);
-                if (frame.Type == 9) throw ParseError(frame.Payload, "start");
-                if (frame.Type != 2) throw Protocol("Expected STARTED or ERROR.");
-            }
+            await StartRequestAsync(payload, false, cancellationToken).ConfigureAwait(false);
+            acknowledged = true;
             lock (sync)
             {
                 if (disposed) throw new ObjectDisposedException(nameof(BrokerProcess));
@@ -172,16 +175,59 @@ public sealed class BrokerProcess : IDisposable
         }
         catch (Exception exception)
         {
-            Exception mapped;
-            if (exception is BrokerException) mapped = exception;
-            else if (stage is "endpoint" or "connect") mapped = Wrap(BrokerErrorCode.Unavailable, stage, exception);
-            else if (stage == "handshake") mapped = Wrap(BrokerErrorCode.Protocol, stage, exception);
-            else if (exception is OperationCanceledException && cancellationToken.IsCancellationRequested) mapped = exception;
-            else if (exception is OperationCanceledException && sentStart) mapped = Wrap(BrokerErrorCode.Timeout, stage, exception);
-            else mapped = Wrap(sentStart ? BrokerErrorCode.ConnectionLost : BrokerErrorCode.InvalidArgument, stage, exception);
+            Exception mapped = exception is BrokerException or OperationCanceledException
+                ? exception : Wrap(acknowledged ? BrokerErrorCode.ConnectionLost : BrokerErrorCode.InvalidArgument,
+                    acknowledged ? "start" : "arguments", exception);
             Fail(mapped);
             client?.Dispose();
             throw mapped;
+        }
+    }
+
+    private async Task<byte[]> StartRequestAsync(byte[] payload, bool detached, CancellationToken cancellationToken)
+    {
+        bool sentStart = false;
+        string stage = "endpoint";
+        try
+        {
+            int port = ReadEndpoint(StartInfo.EndpointFile);
+            client = new TcpClient(AddressFamily.InterNetwork) { NoDelay = true };
+            stage = "connect";
+            using (var deadline = Deadline(cancellationToken, 3))
+                await client.ConnectAsync(IPAddress.Loopback, port, deadline.Token).ConfigureAwait(false);
+            wire = client.GetStream();
+            stage = "handshake";
+            byte[] magic = detached ? DetachedMagic : Magic;
+            using (var deadline = Deadline(cancellationToken, 3))
+            {
+                await wire.WriteAsync(magic, deadline.Token).ConfigureAwait(false);
+                byte[] reply = new byte[magic.Length];
+                await ReadExactlyAsync(reply, deadline.Token).ConfigureAwait(false);
+                if (!reply.AsSpan().SequenceEqual(magic)) throw Protocol("Invalid handshake.");
+            }
+            stage = "start";
+            using (var deadline = Deadline(cancellationToken, 3))
+            {
+                // Any attempted START write can have an unknown outcome; never retry.
+                sentStart = true;
+                await WriteFrameAsync(detached ? (byte)10 : (byte)1, payload, deadline.Token).ConfigureAwait(false);
+                var frame = await ReadFrameAsync(deadline.Token, detached).ConfigureAwait(false);
+                if (frame.Type == 9) throw ParseError(frame.Payload, "start");
+                if (frame.Type != (detached ? 11 : 2)) throw Protocol("Unexpected startup reply.");
+                return frame.Payload;
+            }
+        }
+        catch (Exception exception)
+        {
+            client?.Dispose();
+            if (exception is BrokerException) throw;
+            if (stage is "endpoint" or "connect") throw Wrap(BrokerErrorCode.Unavailable, stage, exception);
+            if (stage == "handshake") throw Wrap(BrokerErrorCode.Protocol, stage, exception);
+            // Preserve managed cancellation behavior; detached cancellation must also
+            // expose that a committed spawn cannot be undone by closing this socket.
+            if (!detached && exception is OperationCanceledException && cancellationToken.IsCancellationRequested) throw;
+            if (exception is OperationCanceledException && sentStart) throw Wrap(BrokerErrorCode.Timeout, stage, exception);
+            throw Wrap(sentStart ? BrokerErrorCode.ConnectionLost : BrokerErrorCode.InvalidArgument, stage, exception);
         }
     }
 
@@ -346,7 +392,7 @@ public sealed class BrokerProcess : IDisposable
         catch (DecoderFallbackException ex) { throw new BrokerException(BrokerErrorCode.Protocol, "Invalid UTF-8 in ERROR.", stage, ex); }
     }
 
-    private async Task<(byte Type, byte[] Payload)> ReadFrameAsync(CancellationToken token)
+    private async Task<(byte Type, byte[] Payload)> ReadFrameAsync(CancellationToken token, bool detached = false)
     {
         byte[] header = new byte[5];
         await ReadExactlyAsync(header, token).ConfigureAwait(false);
@@ -354,10 +400,11 @@ public sealed class BrokerProcess : IDisposable
         uint length = BinaryPrimitives.ReadUInt32BigEndian(header.AsSpan(1));
         bool valid = type switch
         {
-            2 => length == 0,
-            5 or 6 => length is >= 1 and <= 65536,
-            8 => length == 12,
+            2 => !detached && length == 0,
+            5 or 6 => !detached && length is >= 1 and <= 65536,
+            8 => !detached && length == 12,
             9 => length is >= 8 and <= MaxFrame,
+            11 => detached && length == 4,
             _ => false
         };
         if (!valid) throw Protocol("Invalid frame type or length.");
@@ -383,10 +430,18 @@ public sealed class BrokerProcess : IDisposable
         if (!payload.IsEmpty) await wire.WriteAsync(payload, token).ConfigureAwait(false);
     }
 
-    private byte[] EncodeStart()
+    private byte[] EncodeStart(bool detached = false, string? stdoutFile = null, string? stderrFile = null)
     {
-        if (StartInfo.OutputBufferBytes is < 65536 or > 16 * 1024 * 1024) throw Invalid("OutputBufferBytes must be 65536..16777216.");
-        if (StartInfo.MaxEventLineCharacters is < 1 or > 1048576) throw Invalid("MaxEventLineCharacters must be 1..1048576.");
+        if (detached)
+        {
+            if (StartInfo.RedirectStandardInput || StartInfo.RedirectStandardOutput || StartInfo.RedirectStandardError)
+                throw Invalid("Detached startup requires all RedirectStandard* flags false.");
+        }
+        else
+        {
+            if (StartInfo.OutputBufferBytes is < 65536 or > 16 * 1024 * 1024) throw Invalid("OutputBufferBytes must be 65536..16777216.");
+            if (StartInfo.MaxEventLineCharacters is < 1 or > 1048576) throw Invalid("MaxEventLineCharacters must be 1..1048576.");
+        }
         if (string.IsNullOrEmpty(StartInfo.FileName)) throw Invalid("FileName is empty.");
         if (StartInfo.ArgumentList.Count > 4096 || StartInfo.Environment.Count > 4096) throw Invalid("Too many arguments or environment overrides.");
         using var buffer = new MemoryStream();
@@ -417,6 +472,7 @@ public sealed class BrokerProcess : IDisposable
         }
         if (buffer.Length >= MaxFrame) throw new BrokerException(BrokerErrorCode.Limit, "START payload exceeds the protocol limit.", "arguments");
         buffer.WriteByte(StartInfo.RedirectStandardInput ? (byte)1 : (byte)0);
+        if (detached) { Text(stdoutFile ?? ""); Text(stderrFile ?? ""); }
         return buffer.ToArray();
     }
     private static int ReadEndpoint(string? path)

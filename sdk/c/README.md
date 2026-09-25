@@ -14,13 +14,22 @@ clang -std=c11 -Wall -Wextra -Werror -pthread -Isdk/c \
 Alternatively, `add_subdirectory(path/to/sdk/c)` and
 `target_link_libraries(your_app PRIVATE oheco_broker_c)` use the optional CMake
 OBJECT target (no separately installed SDK library). Set
-`OHECO_BROKER_C_SMOKE=ON` to also build `oheco-broker-c-smoke`. CMake 3.16+.
+`OHECO_BROKER_C_SMOKE=ON` to also build `oheco-broker-c-smoke` **in the full
+source checkout only**. CMake 3.16+.
+
+The installed 0.2.0 package is slim: it includes `sdk/c/`, `sdk/dotnet/`, the
+protocol contract and licenses, but not Go source, scripts, examples or tests.
+Embed the two C files directly or use the CMake OBJECT target normally from an
+installed SDK. The optional smoke target stays OFF by default and reports an
+explicit full-checkout requirement if enabled without examples. Build/smoke/test
+commands in this document are repository-root commands; obtain the full checkout
+at the installed `BUILDINFO.txt` source commit to use them.
 
 ## API and ownership
 
 1. Zero-initialize `oheco_broker_options`, set `executable`, `args`/`argc` (arguments
    **excluding argv[0]**), optional cwd, environment overrides, `stdin_enabled`.
-   String pointers are borrowed only during `oheco_broker_start`; strings must be
+   String pointers are borrowed only during the startup call; strings must be
    NUL-terminated strict UTF-8. Invalid Unicode, duplicate environment keys,
    empty executable/keys, `=` in keys and invalid counts are rejected locally.
    Strings cannot represent embedded NUL. Empty cwd uses broker startup cwd.
@@ -42,7 +51,7 @@ OBJECT target (no separately installed SDK library). Set
    final completion. The server applies its TERM/KILL grace period. Repeated
    cancel is idempotent while active; after locally observed EXIT it is a no-op.
 7. `oheco_broker_release` closes/frees the object. Closing an active connection causes
-   server-side cancellation; no detached jobs. NULL release is harmless.
+   server-side cancellation for managed jobs. NULL release is harmless.
 
 `oheco_broker_diagnostic` is optional caller-owned per-call storage. Numeric `oheco_broker_error`
 values exactly match the protocol (OK=0 through LIMIT=8). All discovery and
@@ -58,6 +67,57 @@ The header also retains concise `ob_*`/`OB_*` aliases.
 Malformed frames/UTF-8/EXIT metadata are PROTOCOL. Allocation failure
 is IO and oversized encoded START is LIMIT. Diagnostic native codes are errno
 or pthread error values when available; message text is not a stable API.
+
+## Detached startup (0.2.0)
+
+```c
+uint32_t pid = 0;
+oheco_broker_options options = {0};
+options.executable = "/path/to/service";
+/* options.stdin_enabled must remain 0. */
+oheco_broker_error error = oheco_broker_spawn_detached(
+    endpoint_file, &options, "service.out", "service.err", &pid, &diagnostic);
+```
+
+This separate source API (`ob_spawn_detached` is the short spelling) requires a
+non-NULL PID output pointer; it is set to zero on failure. It returns only after
+one valid DETACHED_STARTED ACK, with a diagnostic PID in 1..2147483647, then
+closes the transport immediately. It returns **no process handle**: no wait,
+output stream, cancel or release operation is available. A PID is not a local
+child/waitpid handle, a readiness check, or a guarantee the process is still alive.
+All options and paths are borrowed for the call and use the same strict UTF-8,
+environment/count validation and 1 MiB total payload limit as managed startup.
+
+`stdin_enabled` must be zero (otherwise INVALID_ARGUMENT); remote stdin is the
+null device. NULL/empty stdout/stderr paths select the null sink. Nonempty paths
+are sent unchanged to the server, which resolves relative paths against the
+effective requested cwd, **not the client's cwd**. The server opens regular
+files append/create, allows a shared stdout/stderr file, and does not create
+parent directories. New files request 0600; existing modes are unchanged and
+shared filesystems may not enforce permissions. Put sensitive logs in private
+paths accessible to the broker.
+
+Managed `oheco_broker_start` still uses wire v1 unchanged. Only detached startup
+uses `OHECOB2\n` and type 10 START_DETACHED; it accepts only type 11 with exactly
+a four-byte valid PID or terminal ERROR. Old v1 servers reject the greeting as
+PROTOCOL **before any START is sent**. There is no version downgrade, managed
+fallback, reconnect or automatic retry. Discovery/connect failures remain exactly
+UNAVAILABLE, failed handshakes PROTOCOL, and valid server ERROR codes are preserved.
+The connect, greeting, and START send/ACK phases each have a 3-second deadline.
+Once START is attempted, connection loss or timeout means **unknown outcome**:
+do not retry, since a service might already be running. A timeout closes the
+transport but does not promise cancellation of detached startup.
+
+The backend launches detached processes in a new POSIX session, without broker
+socket or stream-pipe inheritance. Once OS process creation succeeds, the child
+is committed: disconnect, ACK delivery failure and normal broker shutdown do
+not kill it. While alive, the broker asynchronously reaps direct children; it
+neither waits for nor kills detached services at shutdown. Its limit of 64 tracked
+direct detached children per instance is a memory bound (excess returns LIMIT),
+not containment of daemonized grandchildren. Terminal application termination
+or OS force-stop can still remove descendants; survival is not guaranteed.
+Stopping a detached service is the caller's responsibility using that service's
+own shutdown protocol or terminal controls, not a broker PID-kill API.
 
 ## Threads, deadlines and backpressure
 
@@ -107,7 +167,17 @@ broker-smoke discovery /a/missing/or/malformed/endpoint
 broker-smoke suite /path/to/endpoint /usr/bin/zsh
 broker-smoke run /path/to/endpoint /usr/bin/zsh -c 'printf hello; exit 7'
 broker-smoke run - /usr/bin/zsh -c 'printf default-discovery'
+broker-smoke detached /path/to/endpoint /usr/bin/zsh service.out service.err -c 'printf hello; printf error >&2'
+broker-smoke detached /path/to/endpoint /path/to/service '' '' --service-argument
 ```
+
+`detached ENDPOINT EXEC OUTFILE ERRFILE [ARG...]` prints only the decimal PID
+and exits after ACK. `-` as endpoint selects default discovery; `''` as a log
+path selects the null sink. The smoke never kills detached processes; the parent
+integration test owns their cleanup. To test lifetime, launch a long-running
+service with isolated absolute log paths, retain its PID, verify it after the
+CLI exits and after normal broker shutdown, then stop it explicitly in test
+cleanup. Use a unique service identity and guard against PID reuse.
 
 `run` forwards stdout/stderr and returns the ordinary child exit code (128 for
 signal/cancelled). `suite` requires a shell supporting ordinary sh syntax and
@@ -130,8 +200,19 @@ This Python standard-library-only fixture runner checks malformed discovery,
 refused connect, fragmented binary events, resumable partial header/payload
 read timeouts, protocol type/order/size/UTF-8/EXIT rejection, terminal server
 errors, connection loss and actual 3-second handshake/START response deadlines.
+Detached fixtures additionally check exact v2 request encoding, Unicode/empty
+log paths and args, fragmented greetings/ACKs, PID bounds, malformed/out-of-order
+ACK/ERROR, disconnect and partial-ACK deadlines. They reject any managed fallback
+or retry connection, require client closure after ACK without waiting for server
+EOF, and verify old v1 greeting rejection sends no START.
 All fixture sockets/files are transient. It uses the smoke's internal `resume`
 mode for partial-frame timeout tests.
+
+`tests/c/options_test.c` checks detached local option/path validation (including
+NULL log paths, forbidden stdin, UTF-8 and combined payload bounds) without a
+broker. Compile/link with `sdk/c/oheco_broker.c`, the same flags as smoke, then
+sign/run on HarmonyOS. Use a private temporary directory and trap cleanup for
+both test executables; no new runtime dependencies are needed.
 
 Validated natively on HarmonyOS aarch64 using clang 15.0.4: direct source
 `-std=c11 -Wall -Wextra -Werror -pthread` compilation/link, optional CMake

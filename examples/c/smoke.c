@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "oheco_broker.h"
 #include <errno.h>
+#include <inttypes.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -178,6 +179,16 @@ int main(int argc, char **argv) {
         oheco_broker_release(p); return failed;
     }
     if (argc == 4 && !strcmp(argv[1], "suite")) return suite(argv[2], argv[3]);
+    if (argc >= 6 && !strcmp(argv[1], "detached")) {
+        oheco_broker_options options = {argv[3], NULL, (const char *const *)(argv + 6), (size_t)argc - 6, NULL, 0, 0};
+        uint32_t pid; oheco_broker_diagnostic d;
+        oheco_broker_error e = oheco_broker_spawn_detached(strcmp(argv[2], "-") ? argv[2] : NULL,
+                                                        &options, argv[4], argv[5], &pid, &d);
+        if (e) return report("detached", e, &d);
+        /* The caller/test owns cleanup; do not kill or wait for this PID. */
+        printf("%" PRIu32 "\n", pid);
+        return 0;
+    }
     if (argc >= 4 && !strcmp(argv[1], "run")) {
         oheco_broker_options options = {argv[3], NULL, (const char *const *)(argv + 4), (size_t)argc - 4, NULL, 0, 0};
         oheco_broker_process *p; oheco_broker_diagnostic d; oheco_broker_error e = oheco_broker_start(strcmp(argv[2], "-") ? argv[2] : NULL, &options, &p, &d);
@@ -193,6 +204,6 @@ int main(int argc, char **argv) {
             if (fwrite(event.data, 1, event.size, stream) != event.size) { oheco_broker_release(p); return 1; }
         }
     }
-    fprintf(stderr, "Usage:\n  %s suite ENDPOINT SHELL\n  %s discovery BAD_ENDPOINT\n  %s run ENDPOINT_OR_DASH EXECUTABLE [ARG...]\n", argv[0], argv[0], argv[0]);
+    fprintf(stderr, "Usage:\n  %s suite ENDPOINT SHELL\n  %s discovery BAD_ENDPOINT\n  %s run ENDPOINT_OR_DASH EXECUTABLE [ARG...]\n  %s detached ENDPOINT_OR_DASH EXECUTABLE OUTFILE ERRFILE [ARG...]\n", argv[0], argv[0], argv[0], argv[0]);
     return 2;
 }

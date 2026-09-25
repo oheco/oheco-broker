@@ -23,6 +23,7 @@ const startupTimeout = 3 * time.Second
 const writeTimeout = 10 * time.Second
 const grace = 2 * time.Second
 const maxConnections = 32
+const maxDetachedChildren = 64
 
 // Serve owns l; cancellation closes the listener and cancels managed commands.
 func Serve(ctx context.Context, l net.Listener) error {
@@ -32,6 +33,7 @@ func Serve(ctx context.Context, l net.Listener) error {
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	slots := make(chan struct{}, maxConnections)
+	detached := make(chan struct{}, maxDetachedChildren)
 	for {
 		c, err := l.Accept()
 		if err != nil {
@@ -44,7 +46,7 @@ func Serve(ctx context.Context, l net.Listener) error {
 		select {
 		case slots <- struct{}{}:
 			wg.Add(1)
-			go func() { defer wg.Done(); defer func() { <-slots }(); handle(ctx, c) }()
+			go func() { defer wg.Done(); defer func() { <-slots }(); handle(ctx, c, detached) }()
 		default:
 			_ = c.Close()
 		}
@@ -66,7 +68,7 @@ func (s *sender) fail(code uint32, err error) {
 	_ = s.send(protocol.Error, protocol.EncodeError(code, err))
 }
 
-func handle(parent context.Context, c net.Conn) {
+func handle(parent context.Context, c net.Conn, detached chan struct{}) {
 	defer c.Close()
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
@@ -83,10 +85,10 @@ func handle(parent context.Context, c net.Conn) {
 	s := &sender{c: c}
 	_ = c.SetDeadline(time.Now().Add(startupTimeout))
 	magic := make([]byte, len(protocol.Magic))
-	if _, err := io.ReadFull(c, magic); err != nil || string(magic) != protocol.Magic {
+	if _, err := io.ReadFull(c, magic); err != nil || (string(magic) != protocol.Magic && string(magic) != protocol.MagicV2) {
 		return
 	}
-	if _, err := io.WriteString(c, protocol.Magic); err != nil {
+	if _, err := c.Write(magic); err != nil {
 		return
 	}
 	_ = c.SetDeadline(time.Now().Add(startupTimeout))
@@ -94,8 +96,18 @@ func handle(parent context.Context, c net.Conn) {
 	if err != nil {
 		return
 	}
+	if f.Type == protocol.StartDetached && string(magic) == protocol.MagicV2 {
+		req, e := protocol.DecodeDetached(f.Data)
+		if e != nil {
+			s.fail(protocol.Protocol, e)
+			return
+		}
+		_ = c.SetDeadline(time.Time{})
+		runDetached(ctx, cancel, s, req, detached)
+		return
+	}
 	if f.Type != protocol.Start {
-		s.fail(protocol.Protocol, errors.New("expected START"))
+		s.fail(protocol.Protocol, errors.New("expected START (detached requires protocol v2)"))
 		return
 	}
 	req, err := protocol.DecodeStart(f.Data)

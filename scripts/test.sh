@@ -28,8 +28,9 @@ go test -trimpath -count=1 -timeout=90s ./...
 go vet -trimpath ./...
 go build -trimpath -o "$priv/oheco-broker" ./cmd/oheco-broker
 clang -std=c11 -Wall -Wextra -Werror -pthread -Isdk/c sdk/c/oheco_broker.c examples/c/smoke.c -o "$priv/c-smoke"
+clang -std=c11 -Wall -Wextra -Werror -pthread -Isdk/c sdk/c/oheco_broker.c tests/c/options_test.c -o "$priv/c-options"
 if [ "$(go env GOOS)" = ohos ]; then
-    for binary in "$priv/oheco-broker" "$priv/c-smoke"; do
+    for binary in "$priv/oheco-broker" "$priv/c-smoke" "$priv/c-options"; do
         binary-sign-tool sign -inFile "$binary" -outFile "$binary.signed" -selfSign 1
         chmod 755 "$binary.signed"
         mv "$binary.signed" "$binary"
@@ -43,16 +44,15 @@ while not p.exists():
     if time.monotonic()>end: raise SystemExit("broker startup timed out")
     time.sleep(.05)
 print("Isolated endpoint:",p.read_text().strip())' "$endpoint"
-# A duplicate instance must fail, not overwrite the first endpoint.
-if HOME="$priv/home" XDG_CACHE_HOME="$priv/cache" "$priv/oheco-broker" >"$priv/duplicate.log" 2>&1; then
-    printf '%s\n' 'Duplicate broker unexpectedly started' >&2
-    exit 1
-fi
+# A responding duplicate is a successful no-op, not a second listener.
+HOME="$priv/home" XDG_CACHE_HOME="$priv/other-cache" "$priv/oheco-broker" >"$priv/duplicate.log" 2>&1
+"$priv/c-options"
 python3 tests/c/protocol_test.py "$priv/c-smoke"
 # HarmonyOS sh has self-aliases and external printf; prefer zsh for output loops.
 # shutil.which resolves executables instead of returning an alias declaration.
 shell_bin=$(python3 -c 'import shutil; p=shutil.which("zsh") or shutil.which("sh"); assert p; print(p)')
 "$priv/c-smoke" suite "$endpoint" "$shell_bin"
+python3 tests/lifecycle.py "$priv/oheco-broker" "$priv/c-smoke"
 sh examples/dotnet/test.sh "$endpoint"
 dotnet_bin=$(command -v dotnet)
 "$priv/c-smoke" run "$endpoint" "$dotnet_bin" --version

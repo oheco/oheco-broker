@@ -1,4 +1,4 @@
-# oheco-broker protocol v1
+# oheco-broker protocols v1 and v2 (service 0.2.0)
 
 Status: implementation contract. No JSON, authentication, TLS, compression or third-party codec. Trusted local development ONLY: any local process able to connect can execute commands as the broker user. Discovery is not authenticated.
 
@@ -32,12 +32,29 @@ EXIT reasons: 0 normal (exit_code is 0..255, signal 0), 1 signal (exit_code -1, 
 
 0 OK; 1 UNAVAILABLE; 2 PROTOCOL; 3 SPAWN_FAILED; 4 CONNECTION_LOST; 5 INVALID_ARGUMENT; 6 TIMEOUT; 7 IO; 8 LIMIT.
 
-UNAVAILABLE includes missing/unreadable/empty/malformed discovery file and ALL connect failures. Local caller parameter errors use INVALID_ARGUMENT. After sending START, unexpected connection loss is CONNECTION_LOST and outcome may be unknown. Bad protocol bytes use PROTOCOL. Server startup errors use SPAWN_FAILED. A wait timeout/cancelled wait does not cancel the remote command. Preserve optional stage, native error and message diagnostics without changing these classifications. Resource release closes the connection; if the task is still running, this causes server cancellation. This minimal SDK deliberately does not support detached jobs.
+UNAVAILABLE includes missing/unreadable/empty/malformed discovery file and ALL connect failures. Local caller parameter errors use INVALID_ARGUMENT. After sending START, unexpected connection loss is CONNECTION_LOST and outcome may be unknown. Bad protocol bytes use PROTOCOL. Server startup errors use SPAWN_FAILED. A wait timeout/cancelled wait does not cancel the remote command. Preserve optional stage, native error and message diagnostics without changing these classifications. Resource release closes the connection; if the task is still running, this causes server cancellation. These rules apply to managed START; detached startup uses the separate v2 exchange below.
 
-## Limits and semantics
+## Managed request limits and semantics
 
 Server caps concurrent connections (32), startup deadline (3 seconds per handshake/start phase), frame sizes and stdin buffering. Slow readers have a bounded socket write deadline (10 seconds); failure closes connection and cancels work. C event consumers must continuously drain events; wait convenience APIs drain/discard unconsumed output rather than deadlock. .NET pumps both streams continuously into bounded buffers, and reports a limit error if consumers fail to drain them; no silent drop or unbounded memory. Default .NET nonredirected output is drained/discarded. Event callbacks should not block.
 
-Network startup deadlines close the connection and cancel late startup. They cannot forcibly interrupt a blocked operating-system filesystem/exec syscall; if process creation returns after cancellation, the service kills and reaps that child without acknowledging it. Avoid unavailable network mounts for executables/cwd; service shutdown can be delayed by an uninterruptible OS syscall.
+For managed START, network startup deadlines close the connection and cancel late startup. They cannot forcibly interrupt a blocked operating-system filesystem/exec syscall; if process creation returns after cancellation, the service kills and reaps that child without acknowledging it. Avoid unavailable network mounts for executables/cwd; service shutdown can be delayed by an uninterruptible OS syscall.
 
 Protocol v1 is an intentionally small tool-execution subset, not local Process/waitpid compatibility, a sandbox or a remote host protocol.
+
+## v2: detached startup (0.2.0)
+
+Managed SDK calls continue to use `OHECOB1\n`, unchanged and compatible with 0.1.0. Only the new detached API uses the 8-byte greeting `OHECOB2\n`; the server echoes it. A 0.1.0 server closes/refuses this greeting: SDK returns PROTOCOL without sending START and without any managed-mode fallback. 0.2.0 accepts both greetings. v2 also accepts ordinary START unchanged, but v1 rejects the following new messages.
+
+| Type | Name | Direction | Payload |
+|---|---|---|---|
+| 10 | START_DETACHED | C→S | complete START payload (stdin_enabled MUST be 0), followed by string stdout_file, string stderr_file |
+| 11 | DETACHED_STARTED | S→C | u32 PID, in 1..2147483647 |
+
+All framing/string/count limits and ERROR codes remain unchanged. Max payload includes both log paths. Paths are UTF-8/NUL-free; empty means `/dev/null`. Relative log paths resolve from the effective requested working directory. Nonempty outputs must be regular files (not pipes/devices), opened append/create; same stdout/stderr file is supported. No automatic directory creation. New files request mode 0600, but shared filesystems may not enforce it: sensitive logs belong in accessible private directories. Existing file permissions are not changed. stdin is `/dev/null`.
+
+The reply is either a terminal ERROR or one DETACHED_STARTED and connection closure. There are no STDOUT/STDERR/EXIT frames or Wait/Cancel handles for this API. PID is diagnostic, not a local child/waitpid handle or a promise of readiness/liveness. Once OS process creation succeeds, it is committed: client disconnect, failure to deliver the acknowledgement, and normal broker exit do not cancel the detached process. Failure/timeout after attempting START_DETACHED has an unknown outcome; never automatically retry. Pre-spawn cancellation/timeouts may prevent startup, but a successful late OS spawn must still obey committed detached semantics.
+
+The server uses a new POSIX session, no inherited socket/stdin/output pipes, and reaps direct children asynchronously while alive. It does not wait for or kill detached processes on shutdown. Up to 64 currently tracked direct detached children per service instance; excess startup requests return LIMIT. This is a memory bound, not containment of daemonized grandchildren. Stopping a detached service is its own protocol or the user's terminal responsibility, not a broker PID-kill API. Closing/killing the terminal application or OS force-stop may still remove its descendants and is NOT guaranteed to preserve detached services.
+
+Source APIs: C `oheco_broker_spawn_detached(endpoint_file, options, stdout_file, stderr_file, uint32_t *pid, diagnostic)` (stdin_enabled must be 0); .NET static `BrokerProcess.SpawnDetached[Async](BrokerProcessStartInfo, stdoutFile, stderrFile, ...)` returns diagnostic PID as int and requires all RedirectStandard* flags false. Separate methods preserve existing managed Dispose/cancel semantics and expose no misleading remote Process handle.

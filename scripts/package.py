@@ -3,6 +3,8 @@
 
 Requires native ohos/arm64 Go, binary-sign-tool and Python 3.12+. All intermediate
 files live under TMPDIR. Output: dist/<name>.tar.gz, SHA256SUMS, <name>.build.log.
+Only the signed binary, source SDKs, protocol and install documentation/notices
+are archived; the complete committed snapshot stays private for the native build.
 This does not tag, upload or publish anything and refuses to replace an archive.
 """
 import gzip
@@ -15,6 +17,26 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+
+
+# Explicit install payload: never recursively archive the private build snapshot.
+# Destination -> committed source path. SDK additions require deliberate review.
+SOURCE_FILES = {name: name for name in (
+    "LICENSE", "protocol/PROTOCOL.md",
+    "sdk/c/CMakeLists.txt", "sdk/c/README.md", "sdk/c/oheco_broker.c", "sdk/c/oheco_broker.h",
+    "sdk/dotnet/BrokerProcess.cs", "sdk/dotnet/Oheco.Broker.csproj", "sdk/dotnet/README.md",
+)}
+SOURCE_FILES["README.md"] = "docs/PACKAGE-README.md"
+
+
+def stage_sources(source, payload):
+    for destination, origin in SOURCE_FILES.items():
+        path = source / origin
+        if not path.is_file() or path.is_symlink():
+            raise RuntimeError(f"Missing/non-regular SDK package source: {origin}")
+        target = payload / destination
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, target)
 
 
 def output(*args, cwd):
@@ -52,8 +74,10 @@ def main():
     log_path = dist / f"{name}.build.log"
     with tempfile.TemporaryDirectory(prefix="broker-package-", dir=temporary) as work, log_path.open("w") as log:
         work = Path(work)
-        source = work / name
+        source = work / "source"
         source.mkdir()
+        payload = work / name
+        payload.mkdir()
         snapshot = subprocess.check_output(["git", "archive", "--format=tar", "HEAD"], cwd=root)
         with tarfile.open(fileobj=io.BytesIO(snapshot)) as source_tar:
             source_tar.extractall(source, filter="data")
@@ -75,7 +99,11 @@ def main():
         if actual != f"oheco-broker {version}":
             raise SystemExit(f"Version mismatch: {actual}")
         run([signer, "display-sign", "-inFile", str(binary)])
-        license_dir = source / "licenses"
+        stage_sources(source, payload)
+        (payload / "bin").mkdir()
+        shutil.copyfile(binary, payload / "bin/oheco-broker")
+        (payload / "bin/oheco-broker").chmod(0o755)
+        license_dir = payload / "licenses"
         license_dir.mkdir()
         for filename in ("LICENSE", "PATENTS"):
             shutil.copyfile(goroot / filename, license_dir / f"Go-{filename}")
@@ -83,7 +111,7 @@ def main():
             shutil.copyfile(goroot / "src" / "vendor" / "golang.org" / "x" / module / "LICENSE",
                             license_dir / f"Go-vendor-x-{module}-LICENSE")
         binary_digest = hashlib.sha256(binary.read_bytes()).hexdigest()
-        (source / "BUILDINFO.txt").write_text(
+        (payload / "BUILDINFO.txt").write_text(
             f"version={version}\nplatform=ohos-arm64\nsource_commit={commit}\n"
             f"toolchain={toolchain}\nbinary_sha256={binary_digest}\n"
             "runtime_dependencies=system libc.so\n"
@@ -103,7 +131,7 @@ def main():
         with archive.open("xb") as raw:
             with gzip.GzipFile(fileobj=raw, mode="wb", filename="", mtime=0) as zipped:
                 with tarfile.open(fileobj=zipped, mode="w", format=tarfile.PAX_FORMAT) as packed:
-                    packed.add(source, arcname=name, filter=normalize)
+                    packed.add(payload, arcname=name, filter=normalize)
         digest = hashlib.sha256(archive.read_bytes()).hexdigest()
         (dist / "SHA256SUMS").write_text(f"{digest}  {archive.name}\n", encoding="ascii")
         print(f"source_commit={commit}")

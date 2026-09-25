@@ -51,6 +51,20 @@ typedef struct ob_event {
  * On error *out is NULL; diagnostics are optional and caller-owned. */
 ob_error ob_start(const char *endpoint_file, const ob_options *options,
                   ob_process **out, ob_diagnostic *diagnostic);
+/* Detached startup uses v2 only; managed ob_start remains wire v1.
+ * stdin_enabled MUST be 0. NULL/empty log paths use the null sink; nonempty
+ * paths append/create regular files, relative to the effective remote cwd.
+ * Returns a diagnostic PID (1..INT32_MAX), NOT a local child or wait/cancel
+ * handle. *pid is 0 on error; pid is required, diagnostic is optional.
+ * Closes transport after ACK. A successful OS spawn survives disconnect and
+ * normal broker shutdown, but terminal/OS force-stop survival is not promised.
+ * After attempting START, loss/timeout has UNKNOWN outcome: never retry or
+ * fall back to managed mode. Old servers reject v2 with PROTOCOL safely.
+ * Discovery/connect failures are UNAVAILABLE; phase deadlines are 3 seconds.
+ * All option/path strings are borrowed only for this call. */
+ob_error ob_spawn_detached(const char *endpoint_file, const ob_options *options,
+                           const char *stdout_file, const char *stderr_file,
+                           uint32_t *pid, ob_diagnostic *diagnostic);
 /* At most one event reader/waiter, and one stdin producer, per process.
  * cancel may run concurrently with either; release must not run concurrently.
  * A write has a 3-second total I/O budget. Failure may have sent partial input.
@@ -95,6 +109,7 @@ typedef ob_event oheco_broker_event;
 #define OHECO_BROKER_EVENT_STDERR OB_STDERR
 #define OHECO_BROKER_EVENT_EXIT OB_EXIT
 #define oheco_broker_start ob_start
+#define oheco_broker_spawn_detached ob_spawn_detached
 #define oheco_broker_write_stdin ob_write_stdin
 #define oheco_broker_close_stdin ob_close_stdin
 #define oheco_broker_read_event ob_read_event

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -13,7 +14,7 @@ import (
 	"github.com/oheco/oheco-broker/internal/server"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime)
@@ -26,6 +27,10 @@ func main() {
 		os.Exit(2)
 	}
 	if err := run(); err != nil {
+		if errors.Is(err, discovery.ErrAlreadyRunning) {
+			fmt.Println("oheco-broker is already running.")
+			return
+		}
 		log.Print(err)
 		os.Exit(1)
 	}

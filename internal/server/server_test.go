@@ -47,6 +47,14 @@ func TestHelperProcess(t *testing.T) {
 		signal.Ignore(syscall.SIGTERM)
 		fmt.Fprint(os.Stdout, "ready")
 		time.Sleep(time.Minute)
+	case "detached":
+		b, e := io.ReadAll(os.Stdin)
+		if e != nil || len(b) != 0 {
+			os.Exit(13)
+		}
+		fmt.Fprintf(os.Stdout, "ready:%d\n", os.Getpid())
+		fmt.Fprintln(os.Stderr, "stderr")
+		time.Sleep(time.Minute)
 	case "pid":
 		signal.Ignore(syscall.SIGTERM)
 		fmt.Fprint(os.Stdout, os.Getpid())

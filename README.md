@@ -1,123 +1,115 @@
 # oheco-broker
 
-临时、本机开发用途的命令执行代理：让无法直接启动外部命令的应用，通过回环 TCP 请求终端环境中的 Go 服务执行命令。C 和 .NET 客户端均以源码提供，不要求部署 broker 客户端 `.a` / `.so`，没有第三方依赖、JSON 或配置文件。
+临时、本机开发用途的命令执行代理：由终端环境中的 Go 服务代为执行工具命令。提供无第三方依赖的 C 和纯 .NET 10 源码 SDK，没有 JSON 协议或配置文件。
 
-**安全边界：没有鉴权，也没有加密。任何能连接该回环端口的本机进程，都能以 broker 用户的权限执行任意命令。共享 endpoint 也不能认证服务身份。仅在可信开发设备上主动启动，使用完关闭；不要以 root 运行，不要用于公共、多租户或无人值守环境。随机端口不是安全措施。**
+**没有鉴权或加密。任何能连接端口的本机进程都能以 broker 用户的权限执行命令；共享 endpoint 也不能认证服务身份。仅在可信开发设备上主动启动，不应以 root 运行或无人值守。随机端口不是安全措施。**
 
-## 安装
-
-通过 [oheco 软件目录](https://oheco.org/) 安装：
+## 安装与运行
 
 ```sh
 oo update
 oo install oheco-broker
 oheco-broker --version
-```
-
-也可从 [GitHub Releases](https://github.com/oheco/oheco-broker/releases) 下载 `ohos-arm64` 发行包，并使用随附 `SHA256SUMS` 校验。包内 `bin/oheco-broker` 已签名，运行只依赖系统 `libc.so`，不需要安装 Go 或 .NET；所执行的工具由使用者另行安装。
-
-发行包同时包含完整源码及两套 SDK。使用 `oo` 默认安装目录时，源码 SDK 位于：
-
-```text
-~/.oheco/packages/oheco-broker/0.1.0/sdk/c/
-~/.oheco/packages/oheco-broker/0.1.0/sdk/dotnet/
-```
-
-自定义 `OHECO_ROOT` 时替换上述 `~/.oheco`。C 项目编译 `.c` 并包含 `.h`；C# 项目用 `ProjectReference` 引用 SDK 项目，或直接编译 `BrokerProcess.cs`。无需独立原生 SDK 库。
-
-安装不会启动服务，不修改自启动配置；`oheco-broker@0.1.0` 可使用指定版本入口。
-
-## 使用
-
-在具备工具执行能力的终端中运行：
-
-```sh
 oheco-broker
 ```
 
-服务前台运行，仅监听 `127.0.0.1` 的系统分配端口，并原子写入：
+[GitHub Releases](https://github.com/oheco/oheco-broker/releases) 也提供发行包及 `SHA256SUMS`。平台为 `ohos-arm64`；已签名的 `bin/oheco-broker` 运行只依赖系统 `libc.so`，不需要 Go/.NET。所执行的工具由使用者另行安装。
 
-```text
-$HOME/.oheco/broker/endpoint
-```
+安装不自动启动服务，也不安装系统服务或修改自启动。`oheco-broker@0.2.0` 是指定版本入口。服务前台运行，Ctrl+C/SIGTERM 正常退出。
 
-文件仅一行，例如：
+服务只监听系统分配的回环 TCP 端口，原子写入 `$HOME/.oheco/broker/endpoint`，文件只包含一行：
 
 ```text
 127.0.0.1:35205
 ```
 
-按 Ctrl+C 或发送 SIGTERM 关闭服务。正常退出会清理自己发布的 endpoint 和受管理任务。崩溃可能留下 endpoint；SDK 会根据实际连接结果判断服务不可用。`oheco-broker --version` 输出版本。
+### 重复启动
 
-服务使用 `$XDG_CACHE_HOME/oheco-broker/service.lock` 的文件锁避免同一终端环境内重复启动；未设置 XDG_CACHE_HOME 时使用 TMPDIR。它们应指向支持 flock 的私有真实文件系统，不依赖 HOME 的权限位。锁文件会保留，文件存在不代表锁被占用。不同终端应用的私有目录不同，不提供跨终端应用的全局单例保证。
+`0.2.0` 检查现有 endpoint 并完成 broker 握手；确认已有可用服务时输出 `oheco-broker is already running.`，以 **0** 退出，不覆盖/删除原 endpoint，也不影响已有任务。
 
-## SDK 与统一错误
+单实例互斥使用由规范 HOME 路径派生的固定抽象 Unix socket 名称。它**只用作内核互斥锁，不承载客户端通信**，不产生 socket 文件，不依赖 HOME 的 chmod，也不受 XDG_CACHE_HOME 不同的影响。并发启动只有一个实例获得锁；崩溃由内核释放锁。旧/失效的 endpoint 可以恢复，端口开放但握手不是 broker 不会被误认。
 
-- [C SDK](sdk/c/README.md)：直接把 C 源码加入宿主构建，可使用 CMake OBJECT target。
-- [.NET SDK](sdk/dotnet/README.md)：纯 C#，ProjectReference 或直接包含源码；无需 P/Invoke。
-- [协议规范](protocol/PROTOCOL.md)：一条 TCP 连接执行一个命令，固定帧头与长度前缀。
+互斥范围是同一规范 HOME、同一网络命名空间内的 `0.2.0` 实例。兼容保留私有缓存 `service.lock`，并能发现已经运行的 `0.1.0`；但旧版程序本身不认识新锁，不能保证后来手动启动的旧版在另一缓存目录里也遵守新规则。不要混用旧版启动器。不同应用的安全域/网络命名空间仍受系统策略约束，原生终端测试不替代真实跨应用验收。
 
-SDK 默认读取 `$HOME/.oheco/broker/endpoint`，也可显式传入路径。鸿蒙应用自己的 HOME 不一定是终端 HOME，集成方应传入实际共享发现路径。
+升级时若仍有 `0.1.0` 服务运行，请先正常停止旧服务，再启动新版本；重复启动不会替换运行中的旧进程。
 
-**endpoint 不存在、无法读取、为空、格式无效，以及端口无法连接或连接超时，都统一为 `OHECO_BROKER_ERR_UNAVAILABLE` / `BrokerErrorCode.Unavailable`。** UI 可以直接提示“请先在终端运行 oheco-broker”。错误仍保留阶段、系统错误等诊断信息。
+若锁被占用但 3 秒内没有可握手的 endpoint，或遇到权限/监听等真实错误，非零退出，不强行启动第二个实例。
 
-握手错误使用 PROTOCOL；无法启动目标程序使用 SPAWN_FAILED；已经发送启动请求后断线使用 CONNECTION_LOST（结果可能未知）。命令自身返回非零退出码不是 SDK 错误。SDK 不自动启动 broker、不重试执行请求，也不会把等待超时自动转为任务取消。
+## 源码 SDK
 
-## 执行模型
+默认安装路径（自定义 OHECO_ROOT 时替换 `~/.oheco`）：
 
-- 程序与参数数组直接传给进程 API，不隐式使用 shell。
-- 继承服务的环境，支持本次调用的变量覆盖；使用有效 PATH 和请求的工作目录查找程序。
-- stdin/stdout/stderr 按原始字节传输；EXIT 在输出读完之后发送。
-- 并发执行使用多条连接，最多接受 32 条连接；不做任务 ID、数据库、恢复或脱离运行。
-- 客户端必须持续消费重定向输出。缓冲有限，超限或长时间不读会明确失败，不静默丢弃数据。
-- 取消、断线或服务关闭时，向任务进程组发送 SIGTERM，最多等待 2 秒后 SIGKILL。
-- 命令完成后，清理仍在同一进程组的辅助进程。不保证清理主动脱离进程组的后代；服务被 SIGKILL 后也没有绝对清理保证。
-- 网络启动阶段有 3 秒超时，但 Go 无法强制中断阻塞在内核里的文件系统/exec 调用；迟到的进程会被清理，系统调用长期阻塞仍可能延迟服务退出。不要把失效网络挂载用作工具路径或工作目录。
-- 关闭/Dispose 正在运行的 SDK 句柄会断开连接，因此服务会取消命令。这个极简版本不支持“释放句柄但保留后台任务”。
+```text
+~/.oheco/packages/oheco-broker/0.2.0/sdk/c/
+~/.oheco/packages/oheco-broker/0.2.0/sdk/dotnet/
+```
 
-构建工具尽量关闭长期服务器/节点复用，例如按用途传递 `--disable-build-servers`、`-nr:false` 等；broker 不是持久构建服务器的宿主。
+- [C SDK](sdk/c/README.md)：编译 `oheco_broker.c`，包含 `oheco_broker.h`；可使用 CMake OBJECT target。不需要独立 SDK `.a`/`.so`。
+- [.NET SDK](sdk/dotnet/README.md)：`ProjectReference` 引用 `Oheco.Broker.csproj`，或直接编译 `BrokerProcess.cs`。无需 P/Invoke/额外 NuGet 包。
+- [协议](protocol/PROTOCOL.md)：固定帧头和长度前缀，一条连接一个执行/启动请求。
 
-## 文件与集成边界
+SDK 默认读取 `$HOME/.oheco/broker/endpoint`，可显式传入发现路径。应用自己的 HOME 可能不同，需要传入实际共享路径。**发现文件不存在、读取或格式错误、端口连接失败/超时统一为 UNAVAILABLE**；C 为 `OHECO_BROKER_ERR_UNAVAILABLE`，.NET 为 `BrokerErrorCode.Unavailable`。握手不兼容是 PROTOCOL，不与服务不存在混淆。SDK 不自动启动 broker，也不自动重发命令。
 
-服务与客户端不共享应用身份或私有目录。项目、SDK、构建引用、日志输出路径必须是服务可访问的路径。本项目不做文件传输或路径映射。
+## 两种执行方式
 
-Godot 是潜在调用方而不是服务依赖。本仓库不修改 Godot：原生编辑器需要显式接入 C SDK，GodotTools 需要显式接入 .NET SDK。SDK 不自动拦截 `exec` / `System.Diagnostics.Process.Start`。集成应限制在编辑器和编辑器插件，游戏运行时和导出模板不应引入依赖。
+### 受管理执行（原有接口，v1）
 
-未来系统支持直接执行命令时，只需替换宿主的命令执行适配层，不让构建 UI 依赖 broker 专有概念。
+支持程序/参数数组、cwd、环境变量覆盖、stdin/stdout/stderr、退出码、等待和取消。直接执行程序，不隐式使用 shell。环境继承服务，路径必须是服务可访问的位置。
 
-## 构建与验证
+连接断开、SDK 释放/Dispose、显式取消或 broker 正常退出会取消任务：SIGTERM 后最多等待 2 秒，再强制清理进程组。外层命令退出后会清理同组辅助进程。不保证清理主动脱离进程组的后代。
 
-要求：Go 1.25+（目标平台可用的移植版）、C11 clang/兼容编译器、.NET 10 SDK；鸿蒙二进制签名使用 PATH 中的 `binary-sign-tool`。没有外部 Go module 或 NuGet 包，无需联网构建。
+输出有界，必须持续消费；等待超时只结束等待，不自动取消任务。最多 32 条同时连接。原 v1 SDK 可使用新服务，新 SDK 的受管理调用仍可使用 `0.1.0`。
+
+### 独立后台启动（新接口，v2）
+
+```c
+uint32_t pid;
+oheco_broker_options options = { .executable = "/path/to/server" };
+oheco_broker_diagnostic error;
+int rc = oheco_broker_spawn_detached(NULL, &options,
+    "/path/to/server.out.log", "/path/to/server.err.log", &pid, &error);
+```
+
+```csharp
+var info = new Oheco.Broker.BrokerProcessStartInfo { FileName = "/path/to/server" };
+int pid = await Oheco.Broker.BrokerProcess.SpawnDetachedAsync(
+    info, "/path/to/server.out.log", "/path/to/server.err.log");
+```
+
+- 成功启动到新的 POSIX 会话；连接关闭或 broker 正常退出不会终止它。
+- stdin 是 `/dev/null`。输出文件为空时丢弃到 `/dev/null`；非空时要求普通文件，追加写入，不截断；相对路径按服务处理后的 cwd 解析，目录需预先存在。可以让 stdout/stderr 指向同一文件。
+- 不使用连接对应的输出管道，不能重定向到 SDK 流；.NET 的三个 RedirectStandard* 必须为 false，C 的 stdin_enabled 必须为 0。
+- 只返回诊断 PID。它不是调用方的本地子进程，不支持 `waitpid`，没有 broker 的 Wait/Cancel/重新接管接口。启动成功不等于服务已就绪，停止服务由其自身接口或用户终端负责。
+- broker 存活期间异步回收直接子进程，最多跟踪 64 个存活直接子进程；这不是对子孙进程总数的隔离。
+- 成功创建进程就是提交点，即使启动回执丢失也不撤销。因此发送启动请求后连接丢失/超时属于结果可能未知，**不得自动重试**。
+- 对旧 `0.1.0` 服务，v2 握手明确报 PROTOCOL，不降级成会随连接取消的受管理任务。
+
+**关闭/强停终端应用或系统回收整个应用时的生存性不保证；仅调用 broker 的正常退出不等于系统强停整个应用。** 所有模式仍受系统权限约束，阻塞的内核文件系统/exec 调用也不能由 Go context 强制中断。
+
+## 发行包布局
+
+从 `0.2.0` 开始只包含：已签名服务、两套源码 SDK、必要说明/协议、许可证及 BUILDINFO。**不再把 Go 服务源码、测试、示例和构建脚本装进 package。** 完整源码留在 GitHub；已发布的 `0.1.0` 保持不变。
+
+## 源码构建、测试与发布
+
+以下命令在完整 Git checkout 中运行，不是在精简安装包中运行。要求本机 OHOS Go 1.25+、clang/C11、.NET 10、Python 3.12+ 和 PATH 中的 `binary-sign-tool`；没有外部源码依赖需要联网下载。
 
 ```sh
 sh scripts/build.sh
 sh scripts/test.sh
-```
-
-`build.sh` 生成 `build/oheco-broker`，只构建服务，不产生独立客户端库。测试脚本使用 TMPDIR 中的隔离 HOME、缓存、编译产物和临时服务，退出时清理，不覆盖用户的发现文件，不保留运行中的测试服务。
-
-当前鸿蒙原生验收、工具链版本、真实 `dotnet build` 结果及限制见 [VALIDATION.md](VALIDATION.md)。
-
-仅实现 Unix/POSIX 服务端，首要验收目标为 HarmonyOS/OpenHarmony arm64。其他平台不应视为已验证。鸿蒙中的应用到回环 TCP 的访问仍依赖应用权限和系统版本；终端侧 SDK 验证不能替代真实应用的跨沙箱集成验证。
-
-## 发行构建
-
-在干净且已提交的鸿蒙原生 checkout 中执行：
-
-```sh
-sh scripts/test.sh
+# 提交全部源码并确保工作区干净后：
 python3 scripts/package.py
-python3 tests/release_smoke.py dist/oheco-broker-0.1.0-ohos-arm64.tar.gz
+python3 tests/release_smoke.py dist/oheco-broker-0.2.0-ohos-arm64.tar.gz
 ```
 
-打包脚本从当前 Git 提交导出源码，在私有临时目录编译、签名并生成 `dist/` 下的压缩包、校验和及构建日志，不自动创建标签或发布。归档包含 `BUILDINFO.txt`（源码提交、工具链、二进制摘要）及 Go 运行时代码许可证。已存在的同名归档不会被覆盖。发布烟测会迁移到含空格和 Unicode 的目录，验证服务执行、SDK 文件、版本入口和真实 GitHub 上游访问；外网访问固定使用当前开发环境的 SOCKS5 代理。
+测试使用 TMPDIR 私有目录、隔离 HOME/缓存和测试服务，清理自己创建的后台程序。`tests/lifecycle.py` 验证重复/并发启动、崩溃恢复、独立程序在 broker 退出后存活；可选参数还可验收真实旧版客户端/服务。发行烟测验证精简白名单、来源和摘要、迁移路径、系统库依赖和真实 GitHub 查询（当前开发环境代理 `127.0.0.1:10808`）。
 
-完成上述验证后才能创建对应标签/Release，并更新 `oheco-packages`；正式发布的产物保持不可变。初版说明见 [v0.1.0](docs/releases/v0.1.0.md)。
+打包脚本只在私有临时目录保留完整源码快照以编译，最终归档使用显式白名单。产物不覆盖已有同名归档，包含源码提交、工具链和签名二进制摘要。通过本机验收才创建标签/Release，再更新 packages 和正式索引验收。
 
-## 不包含
+发布说明：[0.2.0](docs/releases/v0.2.0.md)；历史 [0.1.0](docs/releases/v0.1.0.md) 及 [实现初期验证记录](VALIDATION.md)。
 
-TLS/配对授权、PTY、远程主机、文件同步、断线恢复、后台任务、完整 System.Diagnostics.Process 兼容性、系统服务安装和自动拉起。
+## 集成边界与许可证
 
-## 许可证
+不自动拦截 `exec` / `System.Diagnostics.Process.Start`。不做文件同步、PTY、远程主机、后台服务数据库/重连、完整 Process 兼容或系统服务安装。本版本不修改 Godot；接入应限定编辑器及插件，游戏和导出模板不引入依赖。
 
-MIT。版本、协议和 SDK 都在同一个仓库维护。
+MIT。发行包同时保留 Go 运行时代码的相关许可证。

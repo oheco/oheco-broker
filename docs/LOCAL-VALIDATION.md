@@ -1,6 +1,6 @@
 # 0.3.0 验收索引
 
-本次 0.3.0 清理后的 HarmonyOS arm64 原生离线 SDK 构建、完整 Go 测试与 vet、新控制面/C/Go/WSS/真实 direct 与 TURN TCP/UDP 验收，以及原 shell/C/.NET 生命周期与真实 .NET 构建回归均已通过。完整固定源码清单（五套 C 依赖与 Gorilla WebSocket）和归档策略检查通过。最终归档、独立解压 SDK 构建与正式索引安装结果在发布后复核记录中补充；本页同时区分历史公网验证范围。
+本次 0.3.0 清理后的 HarmonyOS arm64 原生离线 SDK 构建、完整 Go 测试与 vet、新控制面/C/Go/WSS/真实 direct 与 TURN TCP/UDP 验收，以及原 shell/C/.NET 生命周期与真实 .NET 构建回归均已通过。完整固定源码清单（五套 C 依赖与 Gorilla WebSocket）和归档策略检查通过。最终归档、独立解压 SDK 构建与正式索引安装结果见下文发行复核记录；本页同时区分历史公网验证范围。
 
 ## 本机原生验证
 
@@ -41,4 +41,20 @@ python3 tests/production_acceptance.py \
 
 ## 最终发行复核
 
-在实际提交与全新构建输入上完成签名 CLI／独立服务端、源码 SDK 离线构建、迁移路径、包内 C++ runtime 和实际归档烟测；记录工具链、source commit、产物 SHA-256 与结果。`BUILDINFO.txt` 和随发行提供的 `SHA256SUMS` 对应最终产物。此处不提前声明新归档或正式索引安装已验收。
+2026-10-04 在 HarmonyOS arm64 上完成最终验证，原生 Go 为 `go1.27.1 ohos/arm64`。发行构建使用全新私有目录和离线输入；[v0.3.0 源码](https://github.com/oheco/oheco-broker/tree/v0.3.0)及归档 `BUILDINFO.txt` 对应 `aecc2fd8247aec361e5573412b7bfd6e75a83127`。
+
+- 签名 CLI、独立服务端与随包 C++ runtime 通过实际 ELF 依赖闭合检查。
+- 从独立 SDK 源码归档解压到含空格目录，完整离线构建成功；实际 Go native 链接及回环 HTTP 调用、C/.NET 源码消费通过。
+- 14829 个源码输入、固定清单、44 份许可 notice、完整 payload 摘要通过；第三方 fixture 原样保留。
+- 包迁移、双命令直接/PATH/版本及相对符号链接、无参数帮助、独立 SQLite/API 启动与 TERM、旧 shell managed/detached 生命周期通过。真实 GitHub 查询经代理通过。
+- [目录提交](https://github.com/oheco/oheco-packages/commit/c090679f4ea7e22c0761471b471cec73a2b8a148)及[Pages 工作流](https://github.com/oheco/oheco-packages/actions/runs/37156777249)成功；[正式索引](https://oheco.org/index/v5/index.json)显示 0.3.0、双命令和 `sdk` 源码项目。
+- `oo 0.10.0` 在隔离目录经正式索引完成 update、install、双命令/版本入口、switch、含空格中文路径 SDK export、全部导出 payload 摘要与 remove。导出无应用二进制，卸载后命令链接和安装目录清除。没有连接或修改生产实例。
+
+[Release](https://github.com/oheco/oheco-broker/releases/tag/v0.3.0)已正式发布并设为 Latest，上传附件的远端大小和服务端 SHA-256 与本地一致：
+
+| 附件 | 字节数 | SHA-256 |
+|---|---:|---|
+| `oheco-broker-0.3.0-ohos-arm64.tar.gz` | 110389864 | `57b17ebf1bcb768d1c480fca0207027719b9f54ae0830fcf2a016d779d2a973a` |
+| `oheco-broker-0.3.0-sdk-source.tar.gz` | 84851015 | `6d9255dc4ba8f1af90fa69f8954abfac01956046b79a625c7234b6bebd11cf27` |
+
+复核记录和验收脚本的后续提交只补充证据／测试隔离顺序，不改变已发布源码 SDK、运行包、标签或附件字节。

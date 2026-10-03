@@ -736,7 +736,6 @@ def run_smoke(archive, base, original_path, sdk_env_path):
                    "--include-go", "--repository-root", str(root)], env, root, timeout=90)
     print("PASS extracted SDK's offline pinned-source checker", flush=True)
     consumer_env = sdk_environment(sdk_env_path, root, env, base)
-    c_consumer, dotnet_consumer = build_consumers(root, base, env, consumer_env)
     binary = root / "bin/oheco-broker"
     server_binary = root / "bin/oheco-broker-server"
     for executable in (binary, server_binary):
@@ -763,6 +762,7 @@ def run_smoke(archive, base, original_path, sdk_env_path):
     require(not (Path(env["HOME"]) / ".oheco/broker/endpoint").exists(), "help/version started the shell server")
     require(not list(Path(env["XDG_CONFIG_HOME"]).rglob("*")), "help/version wrote account configuration")
     print("PASS relocated two entries, direct/PATH/versioned/relative symlinks and no-argument CLI help", flush=True)
+    c_consumer, dotnet_consumer = build_consumers(root, base, env, consumer_env)
     standalone_smoke(server_binary, base, env)
     endpoint_path = Path(env["HOME"]) / ".oheco/broker/endpoint"
     log_path = base / "broker.log"

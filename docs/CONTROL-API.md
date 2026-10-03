@@ -71,7 +71,7 @@ Tenant object:
 {"id":"uuid","name":"tenant","email":"tenant@example.invalid","status":"active","relay_enabled":false,"created_at":"RFC3339","updated_at":"RFC3339"}
 ```
 
-Statuses: `active`, `pending`, `disabled`. Policy: `open`, `approval`, `closed`. Policy is persisted; `Config.RegistrationPolicy` initializes a new database only. A pending registration token can read `/me` and `/me/capabilities` (or its alias) to discover status, but cannot mutate accounts or perform broker/session/relay operations. Admin approval enables the account; the client can login afterwards.
+Statuses: `active`, `pending`, `disabled`. Policy: `open`, `approval`, `closed`. Policy and the boolean `registration_relay_enabled` are persisted; `Config.RegistrationPolicy` and `Config.RegistrationRelayEnabled` initialize a new database only. Defaults are approval registration and relay disabled. A pending registration token can read `/me` and `/me/capabilities` (or its alias) to discover status, but cannot mutate accounts or perform broker/session/relay operations. Admin approval enables the account without changing relay eligibility; the client can login afterwards. Relay must be enabled separately when needed. Changing the registration relay default applies only to newly created tenants.
 
 User name/email/password updates and admin identity/password/disable updates **atomically** bump the tenant version, delete all old account/device/session tokens and sessions, close existing allocations, and mark brokers offline. User updates return a single replacement account token. Admin resets never reveal a generated password: callers must submit one they generated. Recover a broker UUID using a fresh account login and its `/token` endpoint. Account updates do not change tenant/broker UUIDs.
 
@@ -121,7 +121,7 @@ Both native peers must use explicit WS session heartbeats (push/ACK/ping/pong ne
 | POST | `/admin/tenants/{id}/enable` | Set active |
 | POST | `/admin/tenants/{id}/disable` | Revoke all tokens/sessions/allocations, set disabled |
 | POST | `/admin/tenants/{id}/relay` | `{enabled:true|false}`; live capability toggle |
-| GET/PATCH | `/admin/settings` | `registration_policy`: `open`, `approval` or `closed` |
+| GET/PATCH | `/admin/settings` | `{registration_policy,registration_relay_enabled}`; PATCH accepts either/both, atomically; policy is `open`, `approval` or `closed`, relay default is a strict boolean |
 | GET | `/admin/brokers` | `{brokers:[...],next_offset:integer|null}`; `limit`/`offset` pagination, optional `tenant_id=UUID` |
 | GET | `/admin/brokers/{id}` | `{broker}` |
 | GET | `/admin/usage` | All tenants or `?tenant_id=UUID`; optional owned `&broker_id=UUID` |

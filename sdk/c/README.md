@@ -1,29 +1,54 @@
-# Embedded C SDK
+# C source SDK — 0.3.0
 
-Compile `oheco_broker.c` directly into your application, including
-`oheco_broker.h`. Requires C11, POSIX sockets/poll, monotonic clock and pthreads;
-no third-party dependency, JSON, TLS, background pump, installed `.a` or `.so`.
-This is the trusted-local-development protocol in `../../protocol/PROTOCOL.md`,
-not an authenticated service or a security boundary.
+This source SDK has two independent entry points:
+
+- **Local command execution:** embed `oheco_broker.c` and `oheco_broker.h` to call
+  the explicitly started `oheco-broker shell serve`. It needs C11, POSIX
+  sockets/poll, a monotonic clock and pthreads, without third-party libraries,
+  JSON or TLS. The [local wire protocol](../../protocol/PROTOCOL.md) is trusted
+  local development tooling, not an authenticated execution service.
+- **Authenticated remote peers and management:** [remote/ob_remote.h](remote/ob_remote.h)
+  provides peer and TCP/UDP mapping APIs; [remote/ob_api.h](remote/ob_api.h)
+  provides the management API. Its complete fixed xquic, BoringSSL, libjuice,
+  cJSON and curl sources, licenses and manifests are in `tpr/`, with offline
+  builders and probes in `build/`. It uses TLS/WS/WSS and has C++ runtime
+  requirements; the local SDK's no-dependency statement does not apply to it.
+
+The 0.3.0 package distributes **source SDKs, not prebuilt SDK libraries**. Build
+remote inputs natively with installed C/C++ compilers, CMake, Ninja and Python;
+HarmonyOS also needs `binary-sign-tool`. From the package or checkout root:
+
+```sh
+sh sdk/c/build.sh
+. "$XDG_CACHE_HOME/oheco-broker/remote-sdk/remote.env"
+```
+
+The builder is offline and generates static archives plus consumer include/link
+settings in a private cache. Use `--build-dir ABSOLUTE_PATH` for another build
+root and source its `remote-sdk/remote.env`. Keep `remote/`, `tpr/` and `build/`
+together. The embedding host must supply its platform's C/C++ runtimes even when
+SDK libraries are static; the CLI's bundled libc++ does not configure an
+unrelated host application.
+
+For the local command SDK, compile the two files directly, or use
+`add_subdirectory(path/to/sdk/c)` and
+`target_link_libraries(your_app PRIVATE oheco_broker_c)` (a CMake OBJECT target).
+The top-level CMake leaves remote OFF by default. Set `OHECO_BROKER_REMOTE=ON`
+to add `ob_remote`, supplying the built `OB_NATIVE_PREFIX`, `OB_CURL_PREFIX`
+and platform `OB_CXX_RUNTIME` explicitly. CMake 3.16+.
+
+The following API and smoke sections describe the **local command SDK** and
+remain compatible with the legacy service. Example/test commands need the full
+checkout at the `BUILDINFO.txt` source commit, not just installed SDK files:
 
 ```sh
 clang -std=c11 -Wall -Wextra -Werror -pthread -Isdk/c \
   sdk/c/oheco_broker.c examples/c/smoke.c -o "$TMPDIR/broker-smoke"
 ```
 
-Alternatively, `add_subdirectory(path/to/sdk/c)` and
-`target_link_libraries(your_app PRIVATE oheco_broker_c)` use the optional CMake
-OBJECT target (no separately installed SDK library). Set
-`OHECO_BROKER_C_SMOKE=ON` to also build `oheco-broker-c-smoke` **in the full
-source checkout only**. CMake 3.16+.
-
-The installed 0.2.0 package is slim: it includes `sdk/c/`, `sdk/dotnet/`, the
-protocol contract and licenses, but not Go source, scripts, examples or tests.
-Embed the two C files directly or use the CMake OBJECT target normally from an
-installed SDK. The optional smoke target stays OFF by default and reports an
-explicit full-checkout requirement if enabled without examples. Build/smoke/test
-commands in this document are repository-root commands; obtain the full checkout
-at the installed `BUILDINFO.txt` source commit to use them.
+The optional smoke target remains OFF. To build it in the full checkout, set
+`OHECO_BROKER_C_SMOKE=ON` and provide
+`OHECO_BROKER_C_SMOKE_SOURCE` as the absolute path to `examples/c/smoke.c`.
 
 ## API and ownership
 

@@ -1,0 +1,53 @@
+/**
+ * @copyright Copyright (c) 2022, Alibaba Group Holding Limited
+ */
+
+#ifndef XQC_CONN_TEST_H
+#define XQC_CONN_TEST_H
+
+void xqc_test_conn_create();
+void xqc_test_datagram_transport_param_65536(void);
+void xqc_test_datagram_transport_param_varint_max(void);
+void xqc_test_conn_idle_timeout();
+void xqc_test_conn_pmtud_deferred_until_handshake();
+void xqc_test_conn_pmtud_starts_after_handshake();
+void xqc_test_conn_pmtud_force_enable();
+void xqc_test_conn_pmtud_legacy_compatibility();
+void xqc_test_conn_early_data_reject();
+void xqc_test_conn_early_data_reject_flow_ctl();
+
+/* RFC 9000 §20.1 CRYPTO_ERROR dynamic construction */
+void xqc_test_conn_tls_error_cb_constructs_crypto_error();
+void xqc_test_conn_crypto_error_base_value();
+void xqc_test_transport_error_code_passthrough(void);
+void xqc_test_0rtt_error_wire_codes(void);
+void xqc_test_conn_close_transport_crypto_namespace(void);
+void xqc_test_conn_close_application_namespace(void);
+void xqc_test_conn_close_reason_phrase(void);
+void xqc_test_conn_close_reason_no_space(void);
+void xqc_test_conn_close_reason_too_long(void);
+void xqc_test_conn_tls_error_first_writer_wins();
+void xqc_test_conn_tls_error_cb_alert_zero();
+void xqc_test_conn_tls_error_cb_max_alert();
+
+/* 0-RTT transport parameter validation (issue #717, RFC 9000 Section 7.4.1) */
+void xqc_test_0rtt_params_all_equal(void);
+void xqc_test_0rtt_params_all_increased(void);
+void xqc_test_0rtt_params_each_reduced(void);
+
+/* RFC 9000 §7.4.1: forbidden remembered fields must be reset (issue #672) */
+void xqc_test_early_params_forbidden_fields_reset(void);
+
+/* issue #672 computation-level coverage: ungated consumers of remote settings */
+void xqc_test_0rtt_calc_pto_ignores_stale_max_ack_delay(void);
+void xqc_test_0rtt_persistent_congestion_default_max_ack_delay(void);
+void xqc_test_pto_space_no_max_ack_delay_before_confirm(void);
+void xqc_test_0rtt_ack_delay_exponent_default_in_parse(void);
+void xqc_test_0rtt_remote_mad_timeline(void);
+
+/* ALPN negotiation tests (issue #709) */
+void xqc_test_alpn_error_code_value(void);
+void xqc_test_alpn_server_cb_propagates_error(void);
+void xqc_test_alpn_client_handshake_no_alpn(void);
+
+#endif

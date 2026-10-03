@@ -1,0 +1,402 @@
+# Validation
+
+XQUIC validation is layered so local development can get fast feedback while
+pull requests can provide broader evidence.
+
+See the [project instructions](PROJECT_INSTRUCTIONS.md) for related
+architecture and pull-request contracts. Agents executing these commands
+should use the [`xquic-build` skill](../skills/xquic-build/SKILL.md) for
+build-only platform orientation and the
+[`validate` skill](../skills/validate/SKILL.md) for test or validation gates.
+
+## Entry Point
+
+Use the repository-wide script from the repository root:
+
+```bash
+./scripts/validate.sh build
+./scripts/validate.sh test
+```
+
+The commands are intentionally independent of issue and pull request numbers.
+Build and unit-test validation default to `build/validation/`. The legacy
+`full` level exists for explicit full case-suite runs, but it is not the
+default local gate before `scripts/case_test.sh` has targeted selectors.
+
+For feature-gated code, select the feature by manifest key:
+
+```bash
+./scripts/validate.sh build --feature <feature>
+./scripts/validate.sh test --feature <feature>
+```
+
+The script reads feature flags and feature unit-test names from
+`harness/spec/harness-manifest.yml`. The default profile does not enable any
+optional feature-gated build flags.
+
+## Required Coverage Contract
+
+Every production behavior change must include tests tied to the changed path.
+The required minimum is:
+
+- one happy-path unit test;
+- one abnormal, rejection, boundary, or error-branch unit test;
+- endpoint-visible happy-path coverage; and
+- endpoint-visible abnormal-path coverage.
+
+When `scripts/case_test.sh` cases are added, the paired cases must use
+distinct `case_print_result` names and exercise the real `tests/test_client` to
+`tests/test_server` path. Their assertions must prove the expected
+endpoint-visible result. For an error path, prove the specific rejection,
+connection error, close, or recovery behavior rather than accepting any
+failure. Until targeted case execution exists, record missing or unrun
+client-to-server coverage as a gap instead of running the full suite by
+default.
+
+Documentation-only changes are exempt from runtime test creation and instead
+use link, format, and command-syntax checks. Validation-tooling changes require
+the closest deterministic self-checks. The pull request must state why paired
+runtime coverage does not apply.
+
+Harness-only changes must also run:
+
+```bash
+bash harness/scripts/xqc_harness_check.sh
+```
+
+## Client-to-Server Case ID Namespace
+
+The `-x <id>` value shared by `tests/test_client` and `tests/test_server`
+selects case-specific behavior. A case ID is a permanent behavior identifier,
+not a reusable execution slot.
+
+The following registry records IDs present in the current tree or previously
+used in repository history. Range boundaries are inclusive. ID `0` means the
+normal/default path and must not be allocated. Because the older ranges contain
+cross-layer assignments, the complete `[1, 704]` range is frozen for new IDs,
+including gaps.
+
+The registry is the permanent ledger for merged and historical allocations.
+It cannot show every unmerged branch, so each open pull request also holds a
+temporary reservation for every literal case ID present at its published head
+in `scripts/case_test.sh`, `tests/test_client.c`, or `tests/test_server.c`.
+
+| Range | Existing namespace | Permanently reserved IDs |
+|-------|--------------------|--------------------------|
+| `[1, 99]` | Legacy cross-layer QUIC, TLS, HTTP/3, and callback cases | `1-53`, `55-57`, `80`, `99` |
+| `[100, 149]` | Multipath QUIC and path management | `100-110` |
+| `[150, 199]` | HTTP/3 and QPACK settings | `150-153` |
+| `[200, 299]` | QUIC DATAGRAM and HTTP/3 datagram | `200-211` |
+| `[300, 399]` | HTTP/3 extension bytestream | `300-315` |
+| `[400, 499]` | Transport connection settings and extensions | `400`, `450-455` |
+| `[500, 599]` | Frozen legacy cross-layer overflow | `500-502` |
+| `[600, 699]` | Frozen test-runtime and transport mechanics | `600-601` |
+| `[700, 704]` | Frozen protocol-regression overflow | `700-704` |
+
+New cases must allocate from the following layer or module namespace. Update
+the allocated-ID column in the same pull request. An ID remains listed after
+its case is retired so later changes cannot reuse it.
+
+| Range | New-case namespace | Allocated IDs |
+|-------|--------------------|---------------|
+| `[705, 799]` | QUIC Transport core | `705-725` |
+| `[800, 899]` | Recovery and congestion control | `800` |
+| `[900, 999]` | QUIC-TLS | `902-903` |
+| `[1000, 1099]` | HTTP/3 framing, streams, and settings | `1000-1021` |
+| `[1100, 1149]` | QPACK | None |
+| `[1150, 1199]` | HTTP priority | None |
+| `[1200, 1299]` | QUIC DATAGRAM | `1201-1202` |
+| `[1300, 1399]` | Multipath QUIC | None |
+| `[1400, 1499]` | MoQT | None |
+| `[1500, 1599]` | LOC and MSF application protocols | None |
+| `[1600, 1699]` | FEC and experimental transport extensions | None |
+| `[1700, 1799]` | Common runtime, public API, and test harness | None |
+
+Apply these allocation rules before running a new case:
+
+1. Give every new `case_print_result` behavior its own unused ID. The paired
+   happy-path and abnormal-path cases must have different IDs.
+2. Do not assign an active or retired ID to a new behavior. An existing case
+   may keep its ID only when its original behavior contract remains intact.
+3. Select the range for the lowest protocol layer or module that owns the
+   behavior. Cross-layer cases use the lowest layer that injects the condition.
+4. Refresh the intended base, then search the current tree and Git history
+   before allocating an ID:
+
+   ```bash
+   git fetch origin main
+   case_id=1000  # replace with the candidate ID
+   rg -n -- "(^|[^0-9])${case_id}([^0-9]|$)" \
+       scripts/case_test.sh tests/test_client.c tests/test_server.c
+   git log --all -G \
+       "(^|[^0-9])${case_id}([^0-9]|$)" -- \
+       scripts/case_test.sh tests/test_client.c tests/test_server.c
+   ```
+
+   Both commands must return no prior allocation.
+5. Query every open pull request targeting `main` and inspect the exact head
+   commit SHA returned by the query:
+
+   ```bash
+   gh api --paginate \
+       "repos/alibaba/xquic/pulls?state=open&base=main&per_page=100" \
+       --jq '.[] | {number, created_at, head_sha: .head.sha, url: .html_url}'
+   ```
+
+   For each result other than the current pull request, fetch
+   `refs/pull/<number>/head`, verify that its fetched commit equals the reported
+   `headRefOid`, and search the three selector files for the candidate as a
+   complete numeric token. For example:
+
+   ```bash
+   pr=123
+   head_sha=<head_sha-from-query>
+   pr_ref="refs/xquic-harness/pr-${pr}-${head_sha}"
+   cleanup_case_ref() { git update-ref -d "${pr_ref}"; }
+   trap cleanup_case_ref EXIT HUP INT TERM
+   git fetch --quiet origin "refs/pull/${pr}/head:${pr_ref}"
+   test "$(git rev-parse "${pr_ref}")" = "${head_sha}"
+   git grep -n -E "(^|[^0-9])${case_id}([^0-9]|$)" "${pr_ref}" -- \
+       scripts/case_test.sh tests/test_client.c tests/test_server.c
+   cleanup_case_ref
+   trap - EXIT HUP INT TERM
+   ```
+
+   A match means that pull request already reserves the candidate. A failed
+   query, fetch, or head-SHA check is inconclusive and fails the allocation
+   gate; it must not be treated as an empty result. Record the query time, each
+   candidate ID, the number of open pull-request heads checked, the current
+   pull request excluded (if any), and any conflicting PR number and head SHA.
+6. Add the allocated ID to this registry, implement the matching client and
+   server selector behavior, and retain the ID, namespace, case name, command,
+   and result in ignored local validation evidence.
+7. After the local tests pass and immediately before creating or updating the
+   pull request, repeat the open-PR scan. The final validation evidence must use
+   this second snapshot; an earlier acceptance-stage scan is not sufficient.
+8. Publish a pull request that introduces new case IDs, or an updated head that
+   changes them, in draft. Immediately scan again with the current pull request
+   included. This closes the race in which two contributors both passed their
+   pre-publication scans. If no duplicate exists, retain the result locally and
+   the PR may move to review. If duplicate IDs exist, the lowest pull-request
+   number keeps each reservation. Every later pull request using that ID must
+   remain or return to draft, mark local regression incomplete, allocate a new
+   ID, update all selectors and this registry, rerun the complete validation
+   gate, and refresh its evidence. A reservation is released when its pull
+   request closes without merge or publishes a head that no longer contains
+   the ID.
+
+## Levels
+
+### Build
+
+`./scripts/validate.sh build`
+
+- configures a Debug build;
+- uses BoringSSL by default;
+- enables the core test and example targets;
+- enables the congestion-control and QPACK compatibility symbols required by
+  the existing test and example targets;
+- disables optional MoQ support; and
+- compiles the configured targets;
+- builds BoringSSL from an already-present local source checkout when the
+  default static libraries are missing; and
+- prepares local runtime fixture files, including the test server certificate,
+  without running tests.
+
+This is the minimum check for documentation that changes build commands and
+for implementation work that cannot yet run tests. It is not sufficient
+pre-PR evidence for a production behavior change.
+
+### Test
+
+`./scripts/validate.sh test`
+
+Runs the Build level and then the verbose CTest unit suite. The validator
+extracts and records CUnit's `Total`, `Ran`, `Passed`, and `Failed` counts.
+With `XQC_TEST_NAME` unset, the complete-suite gate requires `Ran == Total`
+and `Failed == 0`. A top-level `CTest 1/1` result alone does not satisfy this
+gate.
+
+With `--feature <feature>`, the script applies only that feature's manifest
+flags, runs the complete unit suite, then reruns the feature unit tests listed
+in the manifest so the log contains explicit feature evidence.
+
+### Full
+
+`XQC_BUILD_DIR=build ./scripts/validate.sh full`
+
+Runs the Test level and the existing `scripts/case_test.sh` integration suite.
+This is a legacy explicit command for full case-suite evidence. It is not the
+default local pre-PR command because the current case script lacks targeted
+selectors and can be too expensive for ordinary iteration.
+
+Protocol-specific interoperability, sanitizers, coverage, alternate TLS
+backends, optional modules, and platform matrices remain additional checks.
+They should be selected by change risk or CI policy rather than hidden inside
+an issue-specific build.
+
+## Mandatory Local Pre-PR Gate
+
+Before creating or moving a production code pull request to review:
+
+1. Confirm the paired unit tests and paired client-to-server case tests exist.
+   For new cases, confirm their distinct IDs are registered in the correct
+   namespace, have never appeared in the current tree or Git history, and are
+   not reserved by another open pull request.
+2. Run the complete local unit suite with no focused-test selector:
+
+   ```bash
+   unset XQC_TEST_NAME
+   ./scripts/validate.sh test
+   ```
+
+3. Confirm the emitted CUnit summary reports `Ran == Total` and `Failed == 0`.
+   Record the real result as `<Ran>/<Total> CUnit tests`; do not use
+   `CTest 1/1` as the unit-suite evidence or substitute a fixed example count.
+4. Run targeted client-to-server commands only when the relevant blocks can be
+   executed directly and recorded without the legacy full `case_test.sh` suite.
+   Use `XQC_BUILD_DIR=build ./scripts/validate.sh full` only when explicitly
+   requested or when the change owner accepts the full-suite cost.
+5. Require all unit tests to pass before submitting the pull request. For
+   endpoint-visible behavior, report targeted case results when available;
+   otherwise report the case-test gap instead of claiming local regression is
+   complete.
+6. Repeat the open-PR reservation scan for every new case ID. Fail closed when
+   the query or any head inspection is incomplete, and do not submit or update
+   a pull request while another open pull request reserves an ID.
+
+Retain the detailed gate evidence locally: exact commands, CUnit counts, unit
+and case names, case IDs and namespaces, results, and reservation snapshots.
+The pull request summarizes only:
+
+- each executed client-to-server case as `<ID> — <concise behavior>`;
+- `Local regression: Complete` after the accepted local gate passes, or
+  concise failed or missing case evidence when it does not;
+- `CI: Complete` after required checks pass, or only incomplete check names;
+  and
+- the aggregate `CONTRIBUTING.md` result.
+
+Do not copy commands, test function names, case names, logs, namespace ranges,
+tested commit SHA, or successful reservation snapshots into the PR body.
+
+A focused unit test is iteration evidence only. A missing unit test, failed
+test, or environment blocker does not satisfy the gate; keep the pull request
+in draft until the accepted gate passes. Repeat the gate after every
+subsequent code change so the recorded evidence matches the pull request's
+current head.
+After publishing, a collision is reported only as an incomplete local gate and
+concise blocker. A later pull request with a duplicate case ID does not pass
+the gate even when all runtime tests passed with that ID.
+
+Regardless of local helper usage, a production code pull request must show the
+concise current-head local-regression status and paired client-to-server case
+summary required above.
+
+## Configuration
+
+The default profile supports macOS and Linux with a prebuilt BoringSSL
+checkout. Override paths without editing the script:
+
+```bash
+XQC_BUILD_DIR=build/debug \
+XQC_SSL_PATH=/path/to/boringssl \
+./scripts/validate.sh test
+```
+
+During test development, run one registered CUnit test by name:
+
+```bash
+XQC_TEST_NAME=xqc_test_h3_stream ./scripts/validate.sh test
+```
+
+A focused test is fast feedback, not a replacement for the complete local unit
+gate.
+
+Supported environment variables:
+
+- `XQC_BUILD_DIR`: CMake build directory.
+- `XQC_BUILD_TYPE`: CMake build type, default `Debug`.
+- `XQC_BUILD_JOBS`: maximum parallel build jobs.
+- `XQC_SSL_TYPE`: TLS backend name, default `boringssl`.
+- `XQC_SSL_PATH`: TLS backend root.
+- `XQC_SSL_INCLUDE`: explicit TLS include directory.
+- `XQC_SSL_LIBS`: semicolon-separated TLS library paths.
+- `XQC_BUILD_SSL`: TLS backend build mode, `auto`, `on`, or `off`.
+- `XQC_PREPARE_RUNTIME_FILES`: whether to prepare local runtime fixture files,
+  `on` or `off`.
+- `XQC_TEST_NAME`: optional registered CUnit test name for focused feedback.
+- `XQC_VALIDATION_ARTIFACT_DIR`: validation evidence directory.
+
+Supported feature-profile options:
+
+- `--feature <feature>`: enable only the feature flags listed for that
+  manifest feature.
+- `--list-features`: print available manifest feature keys.
+- `--dry-run`: print the selected level, feature, feature CMake arguments,
+  and feature unit tests without configuring or building.
+
+The script does not install packages, clone dependencies, or modify external
+services. Dependency provisioning remains an explicit environment setup step.
+
+## Artifacts
+
+Each invocation writes ignored artifacts below
+`build/validation/artifacts/` by default. Explicit full case-suite runs may
+write them below `build/artifacts/` when `XQC_BUILD_DIR=build` is selected.
+For task-local command logs, failed-test hypotheses, and final evidence, use
+the [run artifact contract](run-artifacts.md) under
+`build/harness/runs/<task-id>/`.
+
+- `environment.txt`: commit, branch, platform, compiler, CMake version, and
+  selected profile;
+- `<level>.log`: complete command output for the selected validation level,
+  including the normalized CUnit summary and gate result.
+
+Pull requests summarize the aggregate gate and case meanings without repeating
+commands. Raw logs retain the detailed evidence for diagnosis and audit.
+
+The current CMake configuration generates `include/xquic/xqc_configure.h` in
+the source tree. The validation script preserves and restores its pre-build
+contents so validation does not leave a source diff.
+
+## Targeted Endpoint Case Discovery
+
+Endpoint case routing is discovered through `scripts/case_test.sh` selector
+mode, `case_test/manifest.yml`, and native registrations in group runner
+scripts. The harness manifest remains the source of truth for repository module
+ownership. The case-test manifest owns group-level routing: source paths,
+module labels, feature labels, runner paths, and stable shard ports. New
+endpoint cases belong in the relevant `case_test/<module>/<group>.sh` runner
+and are registered with `case_test_case`; they do not require per-case manifest
+entries.
+
+Selector mode is discovery evidence until a group runner implements selected
+execution:
+
+```bash
+bash scripts/case_test.sh --list
+bash scripts/case_test.sh --inventory
+bash scripts/case_test.sh --from-path src/transport/xqc_stream.c --dry-run
+bash scripts/case_test.sh --feature fec --dry-run
+bash scripts/case_test.sh --execution-plan
+bash scripts/case_test.sh --execute --parallel --jobs 4 --module transport
+case_test/lib/architecture_check.rb "$(pwd)" --all
+```
+
+Running `scripts/case_test.sh` without selector arguments executes all
+implemented native groups sequentially. Do not report selector output as a
+passing endpoint case result; report it as identified coverage until the
+selected case body is executable. Selected execution schedules only groups
+marked `execution: implemented` in `case_test/manifest.yml`. The architecture
+check verifies complete and unique native case ownership, runner syntax, mock
+parallel scheduling, stable per-shard port/work-dir assignment, and failed-case
+reporting.
+
+CI may invoke the selected-execution entry point with `--parallel`. The safe
+job count is the number of executable shards that preserve complete and unique
+default-suite coverage. Native group shards count as executable only when
+`--execution-plan` reports `missing_unique_cases=0`; otherwise a full-suite
+parallel request fails closed.
+
+Unit-test execution remains unchanged in this endpoint-case routing change.
+Sequential `./scripts/validate.sh test` remains the default complete-unit gate.

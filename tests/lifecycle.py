@@ -53,7 +53,7 @@ def main():
             nonlocal serial
             serial += 1
             with (root / f"broker-{serial}.log").open("wb") as log:
-                p = subprocess.Popen([binary or args.binary], env=environment(cache), cwd=root,
+                p = subprocess.Popen([binary] if binary else [args.binary, "shell", "serve"], env=environment(cache), cwd=root,
                                      stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
             processes.append(p)
             return p
@@ -96,7 +96,7 @@ def main():
             p = launch(); ready(p)
             saved = endpoint.read_bytes()
             for cache in ("cache", "other-cache", "yet-another-cache"):
-                duplicate = subprocess.run([args.binary], env=environment(cache), cwd=root,
+                duplicate = subprocess.run([args.binary, "shell", "serve"], env=environment(cache), cwd=root,
                                            capture_output=True, timeout=8)
                 assert duplicate.returncode == 0 and b"already running" in duplicate.stdout, duplicate
                 assert endpoint.read_bytes() == saved and p.poll() is None
@@ -150,14 +150,14 @@ def main():
             print("PASS non-broker listener and malformed discovery do not produce false success", flush=True)
 
             bad_cache = root / "not-a-directory"; bad_cache.write_text("file")
-            failed = subprocess.run([args.binary], env=environment("not-a-directory"), cwd=root, capture_output=True, timeout=8)
+            failed = subprocess.run([args.binary, "shell", "serve"], env=environment("not-a-directory"), cwd=root, capture_output=True, timeout=8)
             assert failed.returncode != 0 and b"already running" not in failed.stdout, failed
             print("PASS genuine startup failure remains nonzero", flush=True)
 
             if args.legacy_binary:
                 old = launch("legacy-cache", args.legacy_binary); ready(old)
                 saved = endpoint.read_bytes()
-                duplicate = subprocess.run([args.binary], env=environment("new-again-cache"), cwd=root, capture_output=True, timeout=8)
+                duplicate = subprocess.run([args.binary, "shell", "serve"], env=environment("new-again-cache"), cwd=root, capture_output=True, timeout=8)
                 assert duplicate.returncode == 0 and endpoint.read_bytes() == saved
                 assert client([args.client, "run", str(endpoint), shell, "-c", "printf new-managed-client"]) == b"new-managed-client"
                 refused = subprocess.run([args.client, "detached", str(endpoint), sleeper, "", "", "1"], env=environment("client-cache"), capture_output=True, timeout=8)

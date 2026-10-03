@@ -2,6 +2,9 @@
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 : "${TMPDIR:?TMPDIR must be a writable private directory}"
+# Set skips only after the same source has passed the corresponding gates.
+if [ "${OB_SKIP_BUILD:-0}" != 1 ]; then sh "$root/scripts/build-remote.sh"; fi
+. "$XDG_CACHE_HOME/oheco-broker/remote-sdk/remote.env"
 priv=$(mktemp -d "${TMPDIR%/}/oheco-broker-test.XXXXXX")
 server_pid=''
 cleanup() {
@@ -24,8 +27,10 @@ export GOCACHE="$priv/gocache" GOTMPDIR="$priv/temp" TMPDIR="$priv/temp" GOPROXY
 export DOTNET_CLI_HOME="$priv/dotnet-home" DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 DOTNET_CLI_TELEMETRY_OPTOUT=1
 export DOTNET_GENERATE_ASPNET_CERTIFICATE=false DOTNET_NOLOGO=1 NUGET_PACKAGES="$priv/nuget"
 cd "$root"
-go test -trimpath -count=1 -timeout=90s ./...
-go vet -trimpath ./...
+if [ "${OB_SKIP_GO_CHECKS:-0}" != 1 ]; then
+    go test -trimpath -count=1 -timeout=180s -exec "sh $root/scripts/go-test-exec.sh" ./...
+    go vet -trimpath ./...
+fi
 go build -trimpath -o "$priv/oheco-broker" ./cmd/oheco-broker
 clang -std=c11 -Wall -Wextra -Werror -pthread -Isdk/c sdk/c/oheco_broker.c examples/c/smoke.c -o "$priv/c-smoke"
 clang -std=c11 -Wall -Wextra -Werror -pthread -Isdk/c sdk/c/oheco_broker.c tests/c/options_test.c -o "$priv/c-options"
@@ -36,7 +41,7 @@ if [ "$(go env GOOS)" = ohos ]; then
         mv "$binary.signed" "$binary"
     done
 fi
-HOME="$priv/home" XDG_CACHE_HOME="$priv/cache" "$priv/oheco-broker" >"$priv/broker.log" 2>&1 &
+HOME="$priv/home" XDG_CACHE_HOME="$priv/cache" "$priv/oheco-broker" shell serve >"$priv/broker.log" 2>&1 &
 server_pid=$!
 endpoint="$priv/home/.oheco/broker/endpoint"
 python3 -c 'import pathlib,sys,time; p=pathlib.Path(sys.argv[1]); end=time.monotonic()+10
@@ -45,7 +50,7 @@ while not p.exists():
     time.sleep(.05)
 print("Isolated endpoint:",p.read_text().strip())' "$endpoint"
 # A responding duplicate is a successful no-op, not a second listener.
-HOME="$priv/home" XDG_CACHE_HOME="$priv/other-cache" "$priv/oheco-broker" >"$priv/duplicate.log" 2>&1
+HOME="$priv/home" XDG_CACHE_HOME="$priv/other-cache" "$priv/oheco-broker" shell serve >"$priv/duplicate.log" 2>&1
 "$priv/c-options"
 python3 tests/c/protocol_test.py "$priv/c-smoke"
 # HarmonyOS sh has self-aliases and external printf; prefer zsh for output loops.

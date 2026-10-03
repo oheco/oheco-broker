@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "scope": "oheco-broker native SDK dependencies (Go and curl have separate manifests)",
+  "download_transport": "curl --proxy socks5h://127.0.0.1:10808 -fLsS",
+  "build_network": "forbidden; complete source archives extracted below tpr/",
+  "dependencies": [
+    {
+      "name": "xquic",
+      "path": "sdk/c/tpr/xquic",
+      "upstream": "https://github.com/alibaba/xquic",
+      "tag": "v1.9.7",
+      "commit": "39437fa331cd0faabea76142a1218330fb6885fa",
+      "tar_url": "https://codeload.github.com/alibaba/xquic/tar.gz/39437fa331cd0faabea76142a1218330fb6885fa",
+      "tar_sha256": "8df78c4ba8a6ea71bb2edfe32b2924ac8022a7454c360476fbef968ad7603889",
+      "license": "Apache-2.0",
+      "license_file": "sdk/c/tpr/xquic/LICENSE",
+      "modifications": [],
+      "source_files": 468,
+      "sdk_policy": "SDK checks actual peer QUIC transport parameters through public BoringSSL TLS getter before proof/readiness/OPEN/DATAGRAM; reject nonzero no_crypto. Upstream may internally adopt parameters before SDK gate; no claim of patched-library cipher-policy behavior.",
+      "build": "Unmodified upstream CMake on a cache-owned source snapshot; HTTP/3 retained. Generated source-tree config stays in snapshot, checked-in upstream source remains pristine. SDK dependency probes live under sdk/c/build/probes; full-checkout peer regressions remain under tests/c."
+
+    },
+    {
+      "name": "boringssl",
+      "path": "sdk/c/tpr/boringssl",
+      "upstream": "https://github.com/google/boringssl",
+      "tag": null,
+      "commit": "5e1bfb45c353b2bb36bdf26b006ea8f5566c82d5",
+      "commit_date": "2026-09-30T17:15:39Z",
+      "tar_url": "https://codeload.github.com/google/boringssl/tar.gz/5e1bfb45c353b2bb36bdf26b006ea8f5566c82d5",
+      "tar_sha256": "70c7678524db47b799a9b92cabf39485e4f5819314629e68942452b6e6ba832a",
+      "license": "Apache-2.0; retained support-code notices include Go BSD-3-Clause",
+      "license_file": "sdk/c/tpr/boringssl/LICENSE",
+      "modifications": [],
+      "pake": "Upstream BoringSSL SPAKE2, curve25519.h draft-irtf-cfrg-spake2-02 API; Edwards25519/SHA-512, 32-byte messages, 64-byte keys, upstream cofactor/password-scalar compatibility correction. Not asserted RFC 9382 wire-compatible.",
+      "build": "Static ssl/crypto only, PIC, Release, BUILD_TESTING=OFF, OPENSSL_NO_ASM=ON, FIPS=OFF, no symbol prefix"
+    },
+    {
+      "name": "libjuice",
+      "path": "sdk/c/tpr/libjuice",
+      "upstream": "https://github.com/paullouisageneau/libjuice",
+      "tag": "v1.7.4",
+      "commit": "b89c792e3612faf2f12cf35bcc56857313a06be3",
+      "tar_url": "https://codeload.github.com/paullouisageneau/libjuice/tar.gz/b89c792e3612faf2f12cf35bcc56857313a06be3",
+      "tar_sha256": "713b22174e8cb2e06538fa9bac2650bda21b83c86f5128813ab4dcf8f5bea9ed",
+      "license": "MPL-2.0; retained source-file third-party notices apply",
+      "license_file": "sdk/c/tpr/libjuice/LICENSE",
+      "modifications": [
+        "include/juice/juice.h: append optional bool relay_only to juice_config_t (default false)",
+        "src/agent.c: copy relay_only configuration; centralized local-relayed UDP candidate-pair restriction including peer-reflexive additions and TCP-bypass exclusion, no direct peer connectivity checks or application send/receive in forced mode; host/STUN gathering unchanged"
+      ],
+      "remaining_patch_reason": "Public selected-pair getter and send are separate operations; a peer may trigger later direct nominations between them. Keep minimal atomic physical local-relay policy rather than weaken FORCE or depend on private ABI. SDK-owned paired tests are sdk/c/build/probes/relay_policy_probe.c.",
+      "build": "Standalone native C ICE/STUN/UDP TURN client, static PIC, no Nettle/WebRTC dependency, NO_SERVER=ON, NO_TESTS=ON, localhost candidates enabled, consent freshness retained"
+    },
+    {
+      "name": "cjson",
+      "path": "sdk/c/tpr/cjson",
+      "upstream": "https://github.com/DaveGamble/cJSON",
+      "tag": "v1.7.19",
+      "commit": "c859b25da02955fef659d658b8f324b5cde87be3",
+      "tar_url": "https://codeload.github.com/DaveGamble/cJSON/tar.gz/c859b25da02955fef659d658b8f324b5cde87be3",
+      "tar_sha256": "880a86445ad5cf38f877bac31198268d8fac5d2ce996ebf55d3066a4109ddd8d",
+      "license": "MIT",
+      "license_file": "sdk/c/tpr/cjson/LICENSE",
+      "modifications": [],
+      "source_files": 216,
+      "sdk_policy": "All SDK parser calls use shared ob_json_parse_complete mutex; no global error-pointer API, allocator-hook or locale mutation after threads start.",
+      "build": "C11 static PIC, no cJSON_Utils/tests/sanitizers, upstream custom C89/warning flags disabled"
+    }
+  ]
+}

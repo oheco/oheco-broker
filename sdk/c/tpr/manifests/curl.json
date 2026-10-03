@@ -1,0 +1,22 @@
+{
+  "name": "curl",
+  "version": "8.22.0",
+  "release_date": "2026-09-02",
+  "upstream": "https://github.com/curl/curl",
+  "official_release_listing": "https://curl.se/download.html",
+  "archive_url": "https://curl.se/download/curl-8.22.0.tar.xz",
+  "archive_sha256": "f7ef3ae8a22e521f289803fe93543eb64c329b58aa73a9e224dfd915a2a5f4f7",
+  "archive_bytes": 2953092,
+  "archive_root": "curl-8.22.0",
+  "source_directory": "sdk/c/tpr/curl",
+  "license": "curl",
+  "license_file": "sdk/c/tpr/curl/COPYING",
+  "vendoring": "Complete official release archive, with only the top-level directory renamed to curl. All 4406 regular files byte-identical; no files added, removed, or modified inside the source directory.",
+  "local_modifications": [],
+  "source_files": 4406,
+  "source_tree_sha256": "e7a9569abdd4a55df01c5306694fbe961df2429aff36e03c92eab17e3c087e31",
+  "source_tree_digest_format": "SHA-256 of UTF-8 lines: lowercase file SHA-256 + two ASCII spaces + POSIX relative file path + newline, sorted by relative path. Covers every regular file, rejects extra files.",
+  "acquisition_proxy": "socks5h://127.0.0.1:10808",
+  "verification": "Official HTTPS release archive acquired with normal certificate verification; SHA-256 pinned locally; full archive/source file-name and byte comparison passed. Detached signature downloaded separately but not independently verified; no PGP verification claim.",
+  "build": "Offline project-owned sdk/c/build/build-curl-deps.sh, sdk/c/build/curl-cmake/CMakeLists.txt, sdk/c/build/probes/curl-native-probe.c. Static PIC HTTP/HTTPS, native Clang/libc++, same pinned BoringSSL archives as peer engine, no WebSocket conversion."
+}

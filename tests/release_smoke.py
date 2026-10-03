@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 """Native release acceptance; usage: python3 tests/release_smoke.py ARCHIVE.tar.gz.
 
-Only Python's standard library is used. Requires installed git and dotnet, plus
-TMPDIR on the native private filesystem. All disposable state lives underneath
-TMPDIR; the installed HOME is never used. The only external request is GitHub
-ls-remote through the explicitly configured SOCKS5 proxy. No downloads/builds.
-Use --test-layout for synthetic slim-payload policy checks only (no tools/network).
+Requires native Go/clang, git, dotnet, binary-sign-tool and private TMPDIR.
+All disposable state lives underneath TMPDIR; the installed HOME is never used.
+The only external request is GitHub ls-remote through the explicit SOCKS5 proxy.
+--sdk-env must name the environment emitted by a separate offline build of this
+archive's extracted SDK, not a pre-existing checkout build. Only minimal C/Go/
+.NET consumers are compiled here; the full native dependency build is not repeated.
+Use --test-layout for synthetic payload policy checks only (no build/network).
 """
 
 import hashlib
+import http.client
 import io
+import json
 import os
 import errno
 from pathlib import Path, PurePosixPath
 import re
 import runpy
 import shutil
+import shlex
 import signal
 import socket
 import stat
@@ -28,7 +33,7 @@ import time
 import xml.etree.ElementTree as ET
 
 
-RELEASE_VERSION = "0.2.0"
+RELEASE_VERSION = "0.3.0"
 ROOT_NAME = f"oheco-broker-{RELEASE_VERSION}-ohos-arm64"
 VERSION = f"oheco-broker {RELEASE_VERSION}\n".encode("ascii")
 PROXY = "socks5h://127.0.0.1:10808"
@@ -36,18 +41,41 @@ MAGIC = b"OHECOB1\n"
 MAX_FRAME = 1048576
 MAX_STREAM = 65536
 MAX_OUTPUT = 8 * MAX_FRAME
-# Intentionally independent of the packager: both must agree on the slim payload.
-SOURCE_FILES = {name: name for name in (
-    "LICENSE", "protocol/PROTOCOL.md",
-    "sdk/c/CMakeLists.txt", "sdk/c/README.md", "sdk/c/oheco_broker.c", "sdk/c/oheco_broker.h",
-    "sdk/dotnet/BrokerProcess.cs", "sdk/dotnet/Oheco.Broker.csproj", "sdk/dotnet/README.md",
-)}
+# Independent of the packager; complete trees replace the former SDK whitelist.
+SOURCE_FILES = {name: name for name in ("LICENSE", "protocol/PROTOCOL.md", "go.mod", "go.sum")}
 SOURCE_FILES["README.md"] = "docs/PACKAGE-README.md"
-LICENSE_FILES = {"licenses/Go-LICENSE", "licenses/Go-PATENTS"}
-LICENSE_FILES.update(f"licenses/Go-vendor-x-{module}-LICENSE" for module in ("crypto", "net", "sys", "text"))
-PAYLOAD_FILES = set(SOURCE_FILES) | LICENSE_FILES | {"bin/oheco-broker", "BUILDINFO.txt"}
-PAYLOAD_DIRS = {str(parent) for name in PAYLOAD_FILES
-                for parent in PurePosixPath(name).parents if str(parent) != "."}
+SOURCE_TREES = ("sdk/c", "sdk/go", "sdk/dotnet", "vendor", "vendor-manifests")
+GENERATED_FILES = {"bin/oheco-broker", "bin/oheco-broker-server", "libexec/oheco-broker",
+                   "lib/runtime/libc++_shared.so", "BUILDINFO.txt", "RUNTIME.json", "LICENSES.json",
+                   "THIRD-PARTY-NOTICES.txt", "SHA256SUMS"}
+ELF_FILES = ("libexec/oheco-broker", "bin/oheco-broker-server", "lib/runtime/libc++_shared.so")
+
+
+def digest(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def source_inventory(checkout):
+    sources = dict(SOURCE_FILES)
+    for tree in SOURCE_TREES:
+        directory = checkout / tree
+        require(directory.is_dir(), "missing source SDK/module tree: " + tree)
+        for path in directory.rglob("*"):
+            require(not path.is_symlink(), "unexpected source symlink: " + str(path))
+            if path.is_file():
+                name = path.relative_to(checkout).as_posix()
+                parts = PurePosixPath(name).parts
+                require(not any(p in {".git", "__pycache__", "CMakeFiles", "node_modules"} for p in parts),
+                        "source cache/metadata: " + name)
+                require(path.name not in {"remote.env", "native-deps.env", "curl-deps.env", "CMakeCache.txt"},
+                        "SDK build environment in sources: " + name)
+                if name.startswith("sdk/") and not name.startswith("sdk/c/tpr/"):
+                    require(not any(p in {"bin", "obj", "cache", ".cache"} for p in parts) and
+                            path.suffix.lower() not in {".o", ".a", ".so", ".dll", ".pyc"},
+                            "SDK generated output: " + name)
+                sources[name] = name
+    return sources
 
 
 class SmokeError(Exception):
@@ -122,12 +150,14 @@ def local_command(args, env, cwd, timeout=10):
 
 
 def isolated_environment(base, original_path):
+    require(not base.stat().st_mode & 0o077, "TMPDIR filesystem must enforce private temporary directory permissions")
     env = {"PATH": original_path, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
     for key, name in {
         "HOME": "home", "XDG_CONFIG_HOME": "config", "XDG_CACHE_HOME": "cache",
         "XDG_DATA_HOME": "data", "XDG_STATE_HOME": "state",
         "XDG_RUNTIME_DIR": "runtime", "TMPDIR": "tmp", "DOTNET_CLI_HOME": "dotnet",
         "NUGET_PACKAGES": "nuget", "GOCACHE": "gocache", "GOTMPDIR": "gotmp",
+        "GOMODCACHE": "gomodcache",
     }.items():
         directory = base / name
         directory.mkdir(mode=0o700)
@@ -138,7 +168,9 @@ def isolated_environment(base, original_path):
         "DOTNET_GENERATE_ASPNET_CERTIFICATE": "false", "DOTNET_NOLOGO": "1",
         "DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE": "true",
         "DOTNET_CLI_WORKLOAD_UPDATE_ADVERTISING_DISABLE": "true",
-        "GOPROXY": "off", "GOSUMDB": "off", "GIT_CONFIG_NOSYSTEM": "1",
+        "GOPROXY": "off", "GOSUMDB": "off", "GOTOOLCHAIN": "local", "GOENV": "off", "GOWORK": "off",
+        "GOFLAGS": "-mod=vendor", "CGO_ENABLED": "1", "CC": "clang", "CXX": "clang++",
+        "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0",
         "GCM_INTERACTIVE": "never",
         "HTTP_PROXY": PROXY, "HTTPS_PROXY": PROXY, "ALL_PROXY": PROXY,
@@ -150,9 +182,12 @@ def isolated_environment(base, original_path):
     return env
 
 
-def extract_release(archive, base):
+def extract_release(archive, base, sources=None):
     require(hasattr(tarfile, "data_filter"),
             "Python with tarfile's safe data filter is required (Python 3.12+)")
+    if sources is None:
+        sources = source_inventory(Path(__file__).resolve().parents[1])
+    expected = set(sources) | GENERATED_FILES
     destination = base / "unpack"
     destination.mkdir()
     with tarfile.open(archive, "r:gz") as package:
@@ -170,13 +205,22 @@ def extract_release(archive, base):
             require(str(path) not in seen, "duplicate archive entry: %r" % member.name)
             seen.add(str(path))
             relative = str(path.relative_to(ROOT_NAME))
-            allowed = (relative in PAYLOAD_FILES if member.isfile()
-                       else relative == "." or relative in PAYLOAD_DIRS)
-            require(allowed, "entry outside slim payload allowlist: %r" % member.name)
             if member.isfile():
+                require(relative in expected or relative.startswith("licenses/"),
+                        "entry outside source/runtime payload: %r" % member.name)
                 files.add(relative)
-        require(files == PAYLOAD_FILES, "missing slim payload files: %r" % sorted(PAYLOAD_FILES - files))
+        require(expected <= files, "missing source/runtime payload files: %r" % sorted(expected - files))
+        allowed_dirs = {str(parent) for name in files for parent in PurePosixPath(name).parents}
+        for member in members:
+            if member.isdir():
+                relative = str(PurePosixPath(member.name).relative_to(ROOT_NAME))
+                require(relative in allowed_dirs or relative == ".", "unnecessary payload directory: " + member.name)
         package.extractall(destination, members=members, filter="data")
+    license_index = json.loads((destination / ROOT_NAME / "LICENSES.json").read_text(encoding="utf-8"))
+    require(isinstance(license_index, dict) and bool(license_index), "invalid/empty license inventory")
+    require(files == expected | set(license_index), "unindexed or absent license payload")
+    require(all(isinstance(name, str) and name.startswith("licenses/") for name in license_index),
+            "license inventory entry outside licenses/")
     require([p.name for p in destination.iterdir()] == [ROOT_NAME],
             "archive must have exactly one expected release root")
     relocated = base / "relocated release 空间" / ROOT_NAME
@@ -188,12 +232,20 @@ def extract_release(archive, base):
 def inspect_source(root):
     checkout = Path(__file__).resolve().parents[1]
     require((checkout / ".git").exists(), "run release acceptance from the source Git checkout")
-    for name, origin in sorted(SOURCE_FILES.items()):
+    sources = source_inventory(checkout)
+    for name, origin in sorted(sources.items()):
         path = root / name
-        require(path.is_file() and path.stat().st_size > 0,
-                "missing/empty packaged SDK/document: %s" % name)
-        require(path.read_bytes() == (checkout / origin).read_bytes(),
+        require(path.is_file(), "missing packaged source/document: %s" % name)
+        require(digest(path) == digest(checkout / origin),
                 "packaged SDK/document differs from checkout: %s" % name)
+    for tree in SOURCE_TREES:
+        actual = {p.relative_to(root).as_posix() for p in (root / tree).rglob("*") if p.is_file()}
+        expected = {name for name in sources if name.startswith(tree + "/")}
+        require(actual == expected, "incomplete/extra SDK source tree: " + tree)
+    for resource in ("sdk/c/build.sh", "sdk/c/build/check-native-sources.py",
+                     "sdk/c/tpr/native-dependencies.json", "sdk/c/tpr/manifests/curl.json",
+                     "sdk/c/tpr/patches/libjuice-relay-only.patch", "vendor/modules.txt"):
+        require((root / resource).is_file(), "missing offline SDK build/provenance input: " + resource)
     project = ET.parse(root / "sdk/dotnet/Oheco.Broker.csproj").getroot()
     require(project.tag == "Project" and project.get("Sdk") == "Microsoft.NET.Sdk",
             "invalid .NET SDK project")
@@ -203,7 +255,8 @@ def inspect_source(root):
             ".NET SDK must not introduce third-party package dependencies")
     require("MIT License" in (root / "LICENSE").read_text(encoding="utf-8"),
             "release must include the MIT LICENSE")
-    print("PASS slim C/.NET SDK sources, protocol, installed README and LICENSE match checkout", flush=True)
+    print("PASS complete C/Go/.NET SDK, tpr fixtures, pinned manifests, build resources and vendor sources (%d files)" %
+          len(sources), flush=True)
 
 
 def inspect_provenance(root, git, env):
@@ -217,28 +270,61 @@ def inspect_provenance(root, git, env):
     require(info.get("platform") == "ohos-arm64", "BUILDINFO platform mismatch")
     commit = info.get("source_commit", "")
     require(re.fullmatch(r"[0-9a-f]{40}", commit), "invalid BUILDINFO source_commit")
-    digest = info.get("binary_sha256", "")
-    require(re.fullmatch(r"[0-9a-f]{64}", digest), "invalid BUILDINFO binary_sha256")
-    require(hashlib.sha256((root / "bin/oheco-broker").read_bytes()).hexdigest() == digest,
-            "BUILDINFO binary_sha256 does not match packaged executable")
-    require(info.get("toolchain") and info.get("runtime_dependencies") == "system libc.so" and
-            info.get("configuration") == "none; foreground; unauthenticated loopback development service",
-            "missing/unexpected BUILDINFO toolchain, runtime dependencies or configuration")
+    for key, name in (("cli_sha256", "libexec/oheco-broker"), ("server_sha256", "bin/oheco-broker-server"),
+                      ("runtime_sha256", "lib/runtime/libc++_shared.so")):
+        require(re.fullmatch(r"[0-9a-f]{64}", info.get(key, "")), "invalid BUILDINFO " + key)
+        require(digest(root / name) == info[key], "BUILDINFO hash does not match " + name)
+    require(info.get("toolchain") and
+            info.get("runtime_dependencies") == "system libc.so; bundled lib/runtime/libc++_shared.so" and
+            info.get("sdk_distribution") == "source-only; complete sdk/c including tpr, sdk/go, sdk/dotnet" and
+            info.get("build") == "clean committed snapshot; offline; private TMPDIR; signed native probes and binaries",
+            "missing/unexpected BUILDINFO toolchain, source SDK or clean offline build contract")
+    sums = {}
+    for line in (root / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
+        match = re.fullmatch(r"([0-9a-f]{64})  (.+)", line)
+        require(match is not None, "invalid internal SHA256SUMS line")
+        value, name = match.groups()
+        require(name not in sums and not PurePosixPath(name).is_absolute() and ".." not in PurePosixPath(name).parts,
+                "duplicate/unsafe internal checksum path")
+        sums[name] = value
+    actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()} - {"SHA256SUMS"}
+    require(set(sums) == actual, "internal checksum inventory incomplete or extra")
+    for name, value in sums.items():
+        require(digest(root / name) == value, "payload checksum mismatch: " + name)
     checkout = Path(__file__).resolve().parents[1]
     if (checkout / ".git").exists():
         head, _ = local_command(
             [git, "-c", "safe.directory=" + str(checkout), "rev-parse", "HEAD"], env, checkout)
         require(head.decode("ascii").strip() == commit,
                 "BUILDINFO source_commit does not match checkout HEAD")
-    for name in sorted(LICENSE_FILES):
+    require(info.get("source_files") == str(len(source_inventory(checkout))), "BUILDINFO source inventory count mismatch")
+    notices = json.loads((root / "LICENSES.json").read_text(encoding="utf-8"))
+    for name, record in notices.items():
         path = root / name
-        require(path.is_file() and path.stat().st_size > 0,
-                "missing/empty bundled license: %s" % name)
-    print("PASS BUILDINFO commit=%s binary_sha256=%s and Go/vendor licenses" %
-          (commit, digest), flush=True)
+        require(path.is_file() and path.stat().st_size > 0 and
+                record == {"sha256": digest(path), "bytes": path.stat().st_size},
+                "missing/changed dependency license: " + name)
+    for tree, prefix in (("vendor", "licenses/vendor"), ("sdk/c/tpr", "licenses/native")):
+        for path in (root / tree).rglob("*"):
+            if path.is_file() and re.match(r"^(LICENSE|LICENCE|COPYING|NOTICE|PATENTS|COPYRIGHT)([._-]|$)", path.name, re.I):
+                copy = prefix + "/" + path.relative_to(root / tree).as_posix()
+                require(copy in notices and digest(root / copy) == digest(path),
+                        "actual source license omitted/changed: " + copy)
+    for name in ("licenses/Go-LICENSE", "licenses/Go-PATENTS", "licenses/OHOS-native-NOTICE.txt",
+                 "licenses/SQLite-PUBLIC-DOMAIN.txt"):
+        require(name in notices, "missing toolchain/runtime/SQLite notice: " + name)
+    require(any(name.startswith("licenses/Go-toolchain-vendor/") for name in notices),
+            "Go standard-library vendored dependencies lack notices")
+    text = (root / "THIRD-PARTY-NOTICES.txt").read_text(encoding="utf-8")
+    for source in ("vendor/modules.txt", "sdk/c/tpr/native-dependencies.json", "sdk/c/tpr/manifests/curl.json"):
+        require((root / source).read_text(encoding="utf-8") in text, "third-party notices omit actual provenance: " + source)
+    require("disclaims copyright" in (root / "licenses/SQLite-PUBLIC-DOMAIN.txt").read_text(encoding="utf-8"),
+            "SQLite public-domain notice missing")
+    print("PASS BUILDINFO commit=%s, complete payload hashes and %d Go/native/runtime license notices" %
+          (commit, len(notices)), flush=True)
 
 
-def inspect_elf(binary):
+def inspect_elf(binary, allowed):
     """Read ELF64 DT_NEEDED directly; no readelf/ldd dependency or loader tricks."""
     data = binary.read_bytes()
 
@@ -290,8 +376,28 @@ def inspect_elf(binary):
             end = table.find(b"\0", index)
             require(end >= 0, "unterminated ELF dependency name")
             names.append(table[index:end].decode("ascii", "strict"))
-    require(set(names) <= {"libc.so"}, "unexpected ELF dependencies: %r" % names)
-    print("PASS native ELF; dependencies=%r interpreter=%r" % (names, interpreter), flush=True)
+    require(set(names) <= allowed, "unexpected ELF dependencies: %r" % names)
+    print("PASS native ELF %s; dependencies=%r interpreter=%r" % (binary.name, names, interpreter), flush=True)
+    return {"needed": names, "interpreter": interpreter, "sha256": digest(binary)}
+
+
+def inspect_runtime(root, env, base):
+    recorded = json.loads((root / "RUNTIME.json").read_text(encoding="utf-8"))
+    require(recorded.get("system_libraries") == ["libc.so"] and recorded.get("launcher") == "bin/oheco-broker" and
+            set(recorded.get("elf", {})) == set(ELF_FILES), "unexpected runtime closure manifest")
+    signer = shutil.which("binary-sign-tool", path=env["PATH"])
+    require(signer, "binary-sign-tool is required to inspect actual release signatures")
+    for name in ELF_FILES:
+        allowed = {"libc.so", "libc++_shared.so"} if name == "libexec/oheco-broker" else {"libc.so"}
+        actual = inspect_elf(root / name, allowed)
+        require(actual == recorded["elf"][name], "runtime manifest differs from actual ELF: " + name)
+        if name == "libexec/oheco-broker":
+            require(set(actual["needed"]) == allowed, "CLI C++ dependency must be bundled and explicit")
+        local_command([signer, "display-sign", "-inFile", str(root / name)], env, base)
+    launcher = (root / "bin/oheco-broker").read_text(encoding="utf-8")
+    require(launcher.startswith("#!/usr/bin/sh\n") and 'exec "$root/libexec/oheco-broker" "$@"' in launcher and
+            'LD_LIBRARY_PATH="$root/lib/runtime' in launcher, "CLI launcher does not resolve bundled runtime")
+    print("PASS signed CLI/server/C++ runtime and actual recursive ELF dependency closure", flush=True)
 
 
 def remaining(deadline, stage):
@@ -443,7 +549,178 @@ def wait_endpoint(path, proc):
         time.sleep(0.05)
 
 
-def run_smoke(archive, base, original_path):
+def standalone_smoke(binary, base, env):
+    directory = base / "standalone server 状态"
+    directory.mkdir(mode=0o700)
+    log_path = directory / "server.log"
+    server_env = dict(env, OHECO_BROKER_ADMIN_TOKEN="release-smoke-isolated-admin-token-0123456789abcdef")
+    with log_path.open("wb") as log:
+        proc = subprocess.Popen([str(binary), "--listen", "127.0.0.1:0", "--db", str(directory / "control.sqlite")],
+                                env=server_env, cwd=directory, stdin=subprocess.DEVNULL, stdout=log,
+                                stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            deadline = time.monotonic() + 10
+            ready = None
+            while ready is None:
+                require(proc.poll() is None, "standalone server exited before readiness: " + log_path.read_text(errors="replace"))
+                for line in log_path.read_text(errors="replace").splitlines():
+                    if line.startswith('{'):
+                        event = json.loads(line)
+                        if event.get("event") == "server_ready":
+                            ready = event
+                if ready is None:
+                    remaining(deadline, "standalone server readiness")
+                    time.sleep(0.05)
+            require(ready.get("version") == RELEASE_VERSION and not ready.get("turn") and
+                    re.fullmatch(r"http://127\.0\.0\.1:[0-9]+", ready.get("api", "")),
+                    "standalone server readiness mismatch")
+            port = int(ready["api"].rsplit(":", 1)[1])
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+            try:
+                connection.request("GET", "/v1/me")
+                response = connection.getresponse()
+                response.read(65536)
+                require(response.status == 401, "standalone API did not reject an unauthenticated request")
+            finally:
+                connection.close()
+            database = directory / "control.sqlite"
+            require(database.is_file() and database.read_bytes()[:16] == b"SQLite format 3\0",
+                    "standalone server failed actual SQLite initialization")
+            proc.send_signal(signal.SIGTERM)
+            require(proc.wait(timeout=12) == 0, "standalone server TERM shutdown failed")
+            require(not session_members(proc.pid), "standalone server left child processes")
+        finally:
+            stop_process(proc)
+    print("PASS relocated standalone server, private SQLite, loopback API and bounded TERM shutdown", flush=True)
+
+
+def sdk_environment(path, root, env, base):
+    require(path.is_file() and path.name == "remote.env", "--sdk-env must name the unpacked SDK helper's remote.env")
+    code = "import json,os; print(json.dumps({k:v for k,v in os.environ.items() if k.startswith(('OB_', 'CGO_'))}))"
+    out, err = local_command(["sh", "-c", '. "$1"; exec "$2" -c "$3"', "sdk-smoke-env", str(path),
+                              sys.executable, code], env, base)
+    exports = json.loads(out)
+    for key in ("OB_REMOTE_BUILD", "OB_NATIVE_PREFIX", "OB_CURL_PREFIX", "CGO_CFLAGS", "CGO_LDFLAGS"):
+        require(exports.get(key), "unpacked SDK environment lacks " + key)
+    for key in ("OB_REMOTE_BUILD", "OB_NATIVE_PREFIX", "OB_CURL_PREFIX"):
+        directory = Path(exports[key])
+        require(directory.is_absolute() and directory.is_dir() and
+                not directory.resolve().is_relative_to(Path(__file__).resolve().parents[1]),
+                "SDK prefix must come from a separate extracted-source build: " + key)
+    include_paths = [Path(flag[2:]) for flag in shlex.split(exports["CGO_CFLAGS"]) if flag.startswith("-I")]
+    c_sdk = next((path.parent.resolve() for path in include_paths if (path / "ob_api.h").is_file()), None)
+    require(c_sdk and not c_sdk.is_relative_to(Path(__file__).resolve().parents[1]),
+            "--sdk-env must refer to independently extracted release SDK sources")
+    expected = {path.relative_to(root / "sdk/c").as_posix(): path for path in (root / "sdk/c").rglob("*") if path.is_file()}
+    actual = {path.relative_to(c_sdk).as_posix(): path for path in c_sdk.rglob("*") if path.is_file()}
+    require(set(actual) == set(expected), "external SDK source tree missing/extra release paths")
+    for name, source in expected.items():
+        require(not actual[name].is_symlink() and digest(actual[name]) == digest(source),
+                "external SDK build source differs from this release: " + name)
+    # Include the relocated archive's headers first. Native archives are reused
+    # from the independently built prefix, never copied into the release SDK.
+    exports["CGO_CFLAGS"] = "-I" + shlex.quote(str(root / "sdk/c/remote")) + " " + exports["CGO_CFLAGS"]
+    return dict(env, **exports)
+
+
+def sign_consumer(unsigned, signed, env, base):
+    signer = shutil.which("binary-sign-tool", path=env["PATH"])
+    require(signer, "binary-sign-tool is required for native SDK consumers")
+    local_command([signer, "sign", "-inFile", str(unsigned), "-outFile", str(signed), "-selfSign", "1"], env, base, timeout=30)
+    signed.chmod(0o755)
+
+
+def build_consumers(root, base, env, sdk_env):
+    """Only small consumers; no dependency or peer test suite is rebuilt here."""
+    work = base / "source consumers 空间"
+    work.mkdir()
+    c_source = work / "consume.c"
+    c_source.write_text(r'''#include "oheco_broker.h"
+#include <stdio.h>
+int main(int argc, char **argv) {
+    if (argc != 3) return 2;
+    const char *args[] = {"--version"};
+    ob_options options = {0}; options.executable = argv[2]; options.args = args; options.argc = 1;
+    ob_diagnostic diagnostic = {0}; ob_process *process = NULL;
+    if (ob_start(argv[1], &options, &process, &diagnostic) != OB_OK) {
+        fprintf(stderr, "%s: %s\n", diagnostic.stage, diagnostic.message); return 3;
+    }
+    ob_event event; int result = 4;
+    for (;;) {
+        if (ob_read_event(process, 10000, &event, &diagnostic) != OB_OK) break;
+        if (event.type == OB_STDOUT && fwrite(event.data, 1, event.size, stdout) != event.size) break;
+        if (event.type == OB_STDERR && fwrite(event.data, 1, event.size, stderr) != event.size) break;
+        if (event.type == OB_EXIT) { result = event.result.reason ? 5 : event.result.exit_code; break; }
+    }
+    ob_release(process); return result;
+}
+''', encoding="utf-8")
+    cc = shutil.which("clang", path=env["PATH"])
+    go = shutil.which("go", path=env["PATH"])
+    dotnet = shutil.which("dotnet", path=env["PATH"])
+    require(cc and go and dotnet, "native clang, Go and dotnet are required for source consumers")
+    unsigned, c_binary = work / "c-consumer.unsigned", work / "c-consumer"
+    local_command([cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-I" + str(root / "sdk/c"),
+                   str(c_source), str(root / "sdk/c/oheco_broker.c"), "-o", str(unsigned)], env, work, timeout=30)
+    sign_consumer(unsigned, c_binary, env, work)
+    go_work = root / "sdk-consumer-smoke"
+    go_work.mkdir()
+    (go_work / "main.go").write_text('''package main
+import (
+    "fmt"
+    "net"
+    "net/http"
+    "time"
+    "github.com/oheco/oheco-broker/sdk/go/remote"
+)
+func main() {
+    listener, err := net.Listen("tcp4", "127.0.0.1:0"); if err != nil { panic(err) }
+    server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if r.Method != "GET" || r.URL.Path != "/sdk-smoke" { http.Error(w, "wrong request", 400); return }
+        w.Header().Set("Content-Type", "application/json"); fmt.Fprint(w, `{\"ok\":true}`)
+    })}
+    go server.Serve(listener); defer server.Close()
+    client, err := remote.New(remote.Options{URL: "http://" + listener.Addr().String(), Timeout: 3 * time.Second})
+    if err != nil { panic(err) }; defer client.Close()
+    data, err := client.Request("GET", "/sdk-smoke", nil, nil)
+    if err != nil || string(data) != `{\"ok\":true}` { panic(fmt.Sprintf("response=%s err=%v", data, err)) }
+    fmt.Println("go-sdk-ok")
+}
+''', encoding="utf-8")
+    unsigned, go_binary = work / "go-consumer.unsigned", work / "go-consumer"
+    local_command([go, "build", "-mod=vendor", "-trimpath", "-buildvcs=false", "-o", str(unsigned),
+                   "./sdk-consumer-smoke"], sdk_env, root, timeout=180)
+    sign_consumer(unsigned, go_binary, env, work)
+    runtime_env = dict(env, LD_LIBRARY_PATH=str(root / "lib/runtime"))
+    out, err = local_command([str(go_binary)], runtime_env, work, timeout=15)
+    require(out == b"go-sdk-ok\n" and not err, "Go SDK source consumer failed loopback native API request")
+    dotnet_work = work / "dotnet"
+    dotnet_work.mkdir()
+    source = dotnet_work / "BrokerProcess.cs"
+    shutil.copyfile(root / "sdk/dotnet/BrokerProcess.cs", source)
+    (dotnet_work / "Smoke.csproj").write_text('''<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup>
+<OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings>
+<Nullable>enable</Nullable></PropertyGroup></Project>''', encoding="utf-8")
+    (dotnet_work / "NuGet.Config").write_text('<configuration><packageSources><clear /></packageSources></configuration>', encoding="utf-8")
+    (dotnet_work / "Program.cs").write_text('''using Oheco.Broker;
+var info = new BrokerProcessStartInfo { EndpointFile = args[0], FileName = args[1],
+    RedirectStandardOutput = true, RedirectStandardError = true };
+info.ArgumentList.Add("--version");
+using var process = new BrokerProcess(info);
+await process.StartAsync();
+var output = process.StandardOutput.ReadToEndAsync();
+var errors = process.StandardError.ReadToEndAsync();
+await process.WaitForExitAsync();
+Console.Write(await output); Console.Error.Write(await errors);
+return process.ExitCode;
+''', encoding="utf-8")
+    local_command([dotnet, "build", str(dotnet_work / "Smoke.csproj"), "--configuration", "Release", "--nologo",
+                   "--verbosity", "quiet", "--configfile", str(dotnet_work / "NuGet.Config")], env, dotnet_work, timeout=90)
+    print("PASS source SDK C compile/sign, actual Go native link/loopback request and offline .NET build", flush=True)
+    return c_binary, dotnet_work / "bin/Release/net10.0/Smoke.dll"
+
+
+def run_smoke(archive, base, original_path, sdk_env_path):
     env = isolated_environment(base, original_path)
     git = shutil.which("git", path=original_path)
     dotnet = shutil.which("dotnet", path=original_path)
@@ -454,32 +731,53 @@ def run_smoke(archive, base, original_path):
     root = extract_release(archive, base)
     inspect_source(root)
     inspect_provenance(root, git, env)
+    inspect_runtime(root, env, base)
+    local_command([sys.executable, str(root / "sdk/c/build/check-native-sources.py"),
+                   "--include-go", "--repository-root", str(root)], env, root, timeout=90)
+    print("PASS extracted SDK's offline pinned-source checker", flush=True)
+    consumer_env = sdk_environment(sdk_env_path, root, env, base)
+    c_consumer, dotnet_consumer = build_consumers(root, base, env, consumer_env)
     binary = root / "bin/oheco-broker"
-    require(binary.is_file() and stat.S_IMODE(binary.stat().st_mode) & 0o111,
-            "packaged broker lost executable mode")
-    inspect_elf(binary)
+    server_binary = root / "bin/oheco-broker-server"
+    for executable in (binary, server_binary):
+        require(executable.is_file() and stat.S_IMODE(executable.stat().st_mode) & 0o111,
+                "packaged command lost executable mode: " + executable.name)
     links = base / "command links 命令"
     links.mkdir()
-    link = links / f"oheco-broker@{RELEASE_VERSION}"
-    link.symlink_to(binary)
-    for executable in (binary, link):
-        out, err = local_command([str(executable), "--version"], env, base)
-        require(out == VERSION and not err, "wrong version through %s: %r %r" % (executable, out, err))
-    print("PASS relocated direct and versioned-symlink --version", flush=True)
+    for command, expected in ((binary, VERSION), (server_binary, f"oheco-broker-server {RELEASE_VERSION}\n".encode())):
+        link = links / (command.name + "@" + RELEASE_VERSION)
+        link.symlink_to(command)
+        normal = links / command.name
+        normal.symlink_to(link.name)  # Relative link and a second hop, as installed command maps may use.
+        for executable in (command, link, normal):
+            out, err = local_command([str(executable), "--version"], env, base)
+            require(out == expected and not err, "wrong version through %s: %r %r" % (executable, out, err))
+        path_env = dict(env, PATH=str(links) + os.pathsep + env["PATH"])
+        out, err = local_command([command.name, "--version"], path_env, base)
+        require(out == expected and not err, "PATH command-map version failed")
+    out, err = local_command([str(binary)], env, base)
+    require(b"Usage:" in out and b"shell" in out and b"tenant" in out and not err,
+            "CLI with no arguments must print 0.3.0 help and exit successfully")
+    out, err = local_command([str(server_binary), "--help"], env, base)
+    require(b"Usage: oheco-broker-server" in err and not out, "standalone server --help failed")
+    require(not (Path(env["HOME"]) / ".oheco/broker/endpoint").exists(), "help/version started the shell server")
+    require(not list(Path(env["XDG_CONFIG_HOME"]).rglob("*")), "help/version wrote account configuration")
+    print("PASS relocated two entries, direct/PATH/versioned/relative symlinks and no-argument CLI help", flush=True)
+    standalone_smoke(server_binary, base, env)
     endpoint_path = Path(env["HOME"]) / ".oheco/broker/endpoint"
     log_path = base / "broker.log"
     proc = None
     detached_pid = None
     try:
         with log_path.open("wb") as log:
-            # No flags, pre-created endpoint, or configuration: defaults must work.
-            proc = subprocess.Popen([str(binary)], cwd=root, env=env, stdin=subprocess.DEVNULL,
+            # Legacy shell service remains an explicit 0.3.0 command.
+            proc = subprocess.Popen([str(binary), "shell", "serve"], cwd=root, env=env, stdin=subprocess.DEVNULL,
                                     stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             endpoint = wait_endpoint(endpoint_path, proc)
             duplicate_env = dict(env, XDG_CACHE_HOME=str(base / "duplicate-cache"))
             Path(duplicate_env["XDG_CACHE_HOME"]).mkdir(mode=0o700)
             before = endpoint_path.read_bytes()
-            out, err = local_command([str(binary)], duplicate_env, root)
+            out, err = local_command([str(binary), "shell", "serve"], duplicate_env, root)
             require(out == b"oheco-broker is already running.\n" and not err,
                     "duplicate invocation must exit zero with already-running message")
             require(proc.poll() is None and endpoint_path.read_bytes() == before,
@@ -509,6 +807,13 @@ def run_smoke(archive, base, original_path):
             require(code == 0 and re.fullmatch(rb"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?\r?\n?", out),
                     "dotnet --version failed: %r" % ((code, out, err),))
             print("PASS broker dotnet --version: " + out.decode().strip(), flush=True)
+            for consumer, arguments, label in (
+                (str(c_consumer), [str(endpoint_path), str(binary)], "legacy source C SDK"),
+                (dotnet, [str(dotnet_consumer), str(endpoint_path), str(binary)], "legacy source .NET SDK"),
+            ):
+                out, err = local_command([consumer, *arguments], env, base, timeout=30)
+                require(out == VERSION and not err, label + " did not execute the relocated CLI through shell serve")
+                print("PASS " + label + " command lifecycle through explicit shell serve", flush=True)
             code, out, err = broker_command(
                 endpoint, git,
                 ["-c", "http.proxy=" + PROXY, "-c", "http.sslVerify=true",
@@ -548,17 +853,18 @@ def run_smoke(archive, base, original_path):
 
 
 def test_layout(base):
-    """Synthetic archives only: no Go build, executable, broker or network needed."""
+    """Complete real source staging plus small independent archive policy fixtures."""
     checkout = Path(__file__).resolve().parents[1]
     packager = runpy.run_path(str(checkout / "scripts/package.py"))
-    require(packager["SOURCE_FILES"] == SOURCE_FILES, "packager and acceptance source allowlists differ")
+    sources = source_inventory(checkout)
+    require(packager["SOURCE_FILES"] == SOURCE_FILES and packager["SOURCE_TREES"] == SOURCE_TREES and
+            packager["source_inventory"](checkout) == sources, "packager and acceptance source inventories differ")
     staged = base / "staged"
     staged.mkdir()
     packager["stage_sources"](checkout, staged)
     actual = {p.relative_to(staged).as_posix() for p in staged.rglob("*") if p.is_file()}
-    require(actual == set(SOURCE_FILES), "source staging copied unexpected files")
+    require(actual == set(sources), "source staging copied unexpected files")
     inspect_source(staged)
-    # Ensure consistency checks cannot silently accept different SDK bytes.
     changed = staged / "sdk/c/oheco_broker.h"
     original = changed.read_bytes()
     changed.write_bytes(original + b"\n/* modified */\n")
@@ -569,35 +875,49 @@ def test_layout(base):
     else:
         raise SmokeError("modified packaged SDK passed checkout comparison")
     changed.write_bytes(original)
-
-    cases = [("valid", None, None, False)]
-    for name in ("go.mod", "cmd/main.go", "internal/server.go", "scripts/build.sh",
+    # These extensions are valid pristine source fixtures, never a reason to prune tpr.
+    fixtures = dict(SOURCE_FILES, **{name: name for name in (
+        "sdk/c/oheco_broker.h", "sdk/c/tpr/upstream/test.o", "sdk/c/tpr/upstream/test.a",
+        "sdk/c/tpr/upstream/test.key", "sdk/go/remote/client.go", "vendor/modules.txt")})
+    license_name = "licenses/upstream/LICENSE"
+    files = set(fixtures) | GENERATED_FILES | {license_name}
+    cases = [("valid", None, None, "file")]
+    for name in ("cmd/main.go", "internal/server.go", "scripts/build.sh", "remote.env",
                  "examples/c/smoke.c", "tests/test.py", "VALIDATION.md", "docs/releases/history.md",
-                 ".git/config", "sdk/c/unexpected.c", "sdk/dotnet/bin/library.dll"):
-        cases.append(("extra " + name, name, None, False))
-    cases += [("unexpected directory", "tests", None, True),
-              ("missing SDK", None, "sdk/c/oheco_broker.h", False)]
-    for index, (label, extra, missing, directory) in enumerate(cases):
+                 ".git/config", "sdk/c/unexpected.c", "sdk/c/generated.a", "sdk/dotnet/bin/library.dll",
+                 "sdk/c/tpr/upstream/unrecorded.o", "licenses/unindexed/LICENSE"):
+        cases.append(("extra " + name, name, None, "file"))
+    cases += [("unexpected directory", "tests", None, "directory"),
+              ("missing SDK", None, "sdk/c/oheco_broker.h", "file"),
+              ("missing fixture", None, "sdk/c/tpr/upstream/test.o", "file"),
+              ("missing Go module", None, "go.mod", "file"),
+              ("symlink", "link", None, "symlink"),
+              ("traversal", "../escape", None, "file"),
+              ("duplicate", "go.mod", None, "file")]
+    for index, (label, extra, missing, kind) in enumerate(cases):
         case = base / f"case-{index}"
         case.mkdir()
         archive = case / "fixture.tar.gz"
         with tarfile.open(archive, "w:gz") as package:
-            for name in sorted(PAYLOAD_FILES - ({missing} if missing else set())):
+            for name in sorted(files - ({missing} if missing else set())):
+                data = json.dumps({license_name: {"sha256": "0" * 64, "bytes": 1}}).encode() if name == "LICENSES.json" else b"x"
                 member = tarfile.TarInfo(f"{ROOT_NAME}/{name}")
-                member.size = 1
-                package.addfile(member, io.BytesIO(b"x"))
+                member.size = len(data)
+                package.addfile(member, io.BytesIO(data))
             if extra:
                 member = tarfile.TarInfo(f"{ROOT_NAME}/{extra}")
-                if directory:
+                if kind == "directory":
                     member.type = tarfile.DIRTYPE
+                elif kind == "symlink":
+                    member.type, member.linkname = tarfile.SYMTYPE, "/etc/passwd"
                 package.addfile(member)
         try:
-            extract_release(archive, case)
+            extract_release(archive, case, sources=fixtures)
         except SmokeError:
-            require(label != "valid", "valid slim payload was rejected")
+            require(label != "valid", "valid complete source payload was rejected")
         else:
             require(label == "valid", "unexpected payload accepted: " + label)
-    print("PASS slim staging/SDK consistency and %d archive allowlist fixtures" % len(cases), flush=True)
+    print("PASS complete source staging/tpr fixture preservation and %d archive policy fixtures" % len(cases), flush=True)
 
 
 def interrupted(signum, frame):
@@ -605,7 +925,9 @@ def interrupted(signum, frame):
 
 
 def main():
-    require(len(sys.argv) == 2, "usage: python3 tests/release_smoke.py ARCHIVE.tar.gz | --test-layout")
+    usage = "usage: python3 tests/release_smoke.py ARCHIVE.tar.gz --sdk-env EXTRACTED_BUILD/remote.env | --test-layout"
+    require(len(sys.argv) == 2 and sys.argv[1] == "--test-layout" or
+            len(sys.argv) == 4 and sys.argv[2] == "--sdk-env", usage)
     tmpdir = os.environ.get("TMPDIR")
     require(tmpdir and Path(tmpdir).is_dir() and Path(tmpdir).is_absolute(),
             "TMPDIR must name an existing absolute native private temporary directory")
@@ -620,7 +942,7 @@ def main():
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
     with tempfile.TemporaryDirectory(prefix="broker-release-smoke-", dir=tmpdir) as name:
-        run_smoke(archive, Path(name), original_path)
+        run_smoke(archive, Path(name), original_path, Path(sys.argv[3]).absolute())
     print("PASS release smoke; isolated temporary state removed", flush=True)
 
 

@@ -1,0 +1,40 @@
+[Unit]
+Description=Oheco broker management, WSS and STUN/TURN
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=900
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=oheco-broker
+Group=oheco-broker
+WorkingDirectory=/var/lib/oheco-broker
+EnvironmentFile=/etc/oheco-broker/oheco-broker.env
+ExecStart=/opt/oheco-broker/current/oheco-broker-server --listen=${OHECO_BROKER_LISTEN} --db=/var/lib/oheco-broker/control.sqlite --admin-token-file=${OHECO_BROKER_ADMIN_TOKEN_FILE} --registration=approval --registration-relay=false --tls-cert=${OHECO_BROKER_TLS_CERT} --tls-key=${OHECO_BROKER_TLS_KEY} --tls-reload-interval=30s --turn-listen=${OHECO_BROKER_TURN_LISTEN} --turn-public-ip=${OHECO_BROKER_TURN_PUBLIC_IP} --turn-relay-min-port=${OHECO_BROKER_TURN_RELAY_MIN_PORT} --turn-relay-max-port=${OHECO_BROKER_TURN_RELAY_MAX_PORT}
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=30
+UMask=0077
+StateDirectory=oheco-broker
+StateDirectoryMode=0700
+RuntimeDirectory=oheco-broker
+RuntimeDirectoryMode=0700
+Environment=TMPDIR=/run/oheco-broker
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+LockPersonality=yes
+LimitNOFILE=8192
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

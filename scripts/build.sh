@@ -2,6 +2,8 @@
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 : "${TMPDIR:?TMPDIR must be a writable private directory}"
+sh "$root/scripts/build-remote.sh"
+. "$XDG_CACHE_HOME/oheco-broker/remote-sdk/remote.env"
 priv=$(mktemp -d "${TMPDIR%/}/oheco-broker-build.XXXXXX")
 trap 'rm -rf "$priv"' EXIT
 export GOCACHE="$priv/gocache" GOTMPDIR="$priv" GOPROXY=off GOSUMDB=off
@@ -14,7 +16,13 @@ if [ "$(go env GOOS)" = ohos ]; then
     cp "$priv/oheco-broker.signed" "$priv/oheco-broker"
 fi
 "$priv/oheco-broker" --version
-mkdir -p "$root/build"
-cp -p "$priv/oheco-broker" "$root/build/oheco-broker"
-"$root/build/oheco-broker" --version
-printf 'Built %s\n' "$root/build/oheco-broker"
+# Native artifacts belong on a real cache filesystem, not HOME/hmdfs. Avoid
+# overwriting the old checkout binary or an inode used by a running process.
+dest="$XDG_CACHE_HOME/oheco-broker/bin"
+mkdir -p "$dest"
+staged=$(mktemp "$dest/.oheco-broker.XXXXXX")
+trap 'rm -rf "$priv"; rm -f "$staged"' EXIT
+cp -p "$priv/oheco-broker" "$staged"
+mv -f "$staged" "$dest/oheco-broker"
+"$dest/oheco-broker" --version
+printf 'Built %s\n' "$dest/oheco-broker"

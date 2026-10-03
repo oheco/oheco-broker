@@ -73,15 +73,17 @@ configure "$root/tpr/cjson" "$build/cjson" \
     -DCMAKE_C_STANDARD=11 -DCMAKE_C_STANDARD_REQUIRED=ON
 "$cmake" --build "$build/cjson" --target cjson -j "$jobs"
 "$cmake" --install "$build/cjson"
-python3 - "$build" "$prefix" "$sdk_cxx_runtime" <<'PY'
+python3 -B - "$build" "$prefix" "$sdk_cxx_runtime" "$root" <<'PY'
 import pathlib,shlex,sys
+sys.path.insert(0, str(pathlib.Path(sys.argv[4])/'build'))
+from cgo_flags import join
 build,prefix=map(pathlib.Path,sys.argv[1:3]);runtime=sys.argv[3];libs=['libxquic-static.a','libjuice.a','libcjson.a','libssl.a','libcrypto.a']
 values={'NATIVE_BUILD_DIR':str(build),'NATIVE_PREFIX':str(prefix),'NATIVE_INCLUDE_DIR':str(prefix/'include'),
         'BORINGSSL_BUILD_DIR':str(build/'boringssl'),'BORINGSSL_INCLUDE_DIR':str(prefix/'include'),
         'BORINGSSL_SSL_LIBRARY':str(prefix/'lib/libssl.a'),'BORINGSSL_CRYPTO_LIBRARY':str(prefix/'lib/libcrypto.a'),
         'XQUIC_LIBRARY':str(prefix/'lib/libxquic-static.a'),'JUICE_LIBRARY':str(prefix/'lib/libjuice.a'),'CJSON_LIBRARY':str(prefix/'lib/libcjson.a'),
-        'NATIVE_CPPFLAGS':'-I'+shlex.quote(str(prefix/'include'))+' -DJUICE_STATIC',
-        'NATIVE_LDFLAGS':' '.join(shlex.quote(str(prefix/'lib'/n)) for n in libs)+' -l'+runtime+' -pthread -lm -ldl'}
+        'NATIVE_CPPFLAGS':join(['-I'+str(prefix/'include'), '-DJUICE_STATIC']),
+        'NATIVE_LDFLAGS':join([*(str(prefix/'lib'/n) for n in libs), '-l'+runtime, '-pthread', '-lm', '-ldl'])}
 (build/'native-deps.env').write_text(''.join('export '+k+'='+shlex.quote(v)+'\n' for k,v in values.items()))
 cm='find_package(Threads REQUIRED)\n'
 for name,lib in zip(['xquic','juice','cjson','ssl','crypto'],libs):

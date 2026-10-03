@@ -60,8 +60,8 @@ NuGet packages. Reference its project or include `BrokerProcess.cs`. Local C and
 they do not start it. Remote management/peer consumers connect to the trusted
 service configured by their application.
 
-Read `sdk/c/README.md`, `sdk/c/remote/README.md`, `sdk/go/remote/README.md` when
-present, and `sdk/dotnet/README.md` for API integration. The source fixtures may
+Read `sdk/c/README.md`, `sdk/c/remote/README.md`, `sdk/go/README.md` and
+`sdk/dotnet/README.md` for API integration. The source fixtures may
 include `.o`, `.a`, `.pem` or `.key` files retained verbatim from pinned upstream
 archives; they are test data, not SDK build outputs or personal signing material.
 

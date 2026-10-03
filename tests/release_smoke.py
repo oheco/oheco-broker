@@ -619,7 +619,7 @@ def sdk_environment(path, root, env, base):
                 "external SDK build source differs from this release: " + name)
     # Include the relocated archive's headers first. Native archives are reused
     # from the independently built prefix, never copied into the release SDK.
-    exports["CGO_CFLAGS"] = "-I" + shlex.quote(str(root / "sdk/c/remote")) + " " + exports["CGO_CFLAGS"]
+    exports["CGO_CFLAGS"] = shlex.quote("-I" + str(root / "sdk/c/remote")) + " " + exports["CGO_CFLAGS"]
     return dict(env, **exports)
 
 
@@ -676,13 +676,13 @@ import (
 func main() {
     listener, err := net.Listen("tcp4", "127.0.0.1:0"); if err != nil { panic(err) }
     server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        if r.Method != "GET" || r.URL.Path != "/sdk-smoke" { http.Error(w, "wrong request", 400); return }
+        if r.Method != "GET" || r.URL.Path != "/v1/sdk-smoke" { http.Error(w, "wrong request", 400); return }
         w.Header().Set("Content-Type", "application/json"); fmt.Fprint(w, `{\"ok\":true}`)
     })}
     go server.Serve(listener); defer server.Close()
     client, err := remote.New(remote.Options{URL: "http://" + listener.Addr().String(), Timeout: 3 * time.Second})
     if err != nil { panic(err) }; defer client.Close()
-    data, err := client.Request("GET", "/sdk-smoke", nil, nil)
+    data, err := client.Request("GET", "/v1/sdk-smoke", nil, nil)
     if err != nil || string(data) != `{\"ok\":true}` { panic(fmt.Sprintf("response=%s err=%v", data, err)) }
     fmt.Println("go-sdk-ok")
 }

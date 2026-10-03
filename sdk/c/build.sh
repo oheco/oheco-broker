@@ -34,15 +34,18 @@ sdk_refresh_cache "$root/remote" "$build"
     -DOB_NATIVE_PREFIX="$native" -DOB_CURL_PREFIX="$curl" \
     -DOB_CXX_RUNTIME="$sdk_cxx_runtime" -DOB_REMOTE_BUILD_TESTS=OFF
 "$cmake" --build "$build" --parallel "${NATIVE_JOBS:-4}"
-python3 - "$build" "$native" "$curl" "$root" "$sdk_cxx_runtime" <<'PY'
+python3 -B - "$build" "$native" "$curl" "$root" "$sdk_cxx_runtime" <<'PY'
 import pathlib, shlex, sys
 build, native, curl, root = sys.argv[1:5]
+sys.path.insert(0, str(pathlib.Path(root)/'build'))
+from cgo_flags import join
 quote = shlex.quote
-flags = ' '.join('-L'+quote(str(pathlib.Path(p)/'lib')) for p in (native, curl))
-flags = '-L'+quote(build)+' '+flags+' -lob_remote -lcurl -lxquic-static -ljuice -lcjson -lssl -lcrypto -l'+sys.argv[5]+' -pthread -lm -ldl'
+flags = join(['-L'+build, *('-L'+str(pathlib.Path(p)/'lib') for p in (native, curl)),
+              '-lob_remote', '-lcurl', '-lxquic-static', '-ljuice', '-lcjson', '-lssl', '-lcrypto',
+              '-l'+sys.argv[5], '-pthread', '-lm', '-ldl'])
 values = {'OB_REMOTE_BUILD':build, 'OB_NATIVE_PREFIX':native, 'OB_CURL_PREFIX':curl,
           'OB_CXX_RUNTIME':sys.argv[5], 'CGO_ENABLED':'1',
-          'CGO_CFLAGS':'-I'+quote(str(pathlib.Path(root)/'remote')), 'CGO_LDFLAGS':flags,
+          'CGO_CFLAGS':join(['-I'+str(pathlib.Path(root)/'remote')]), 'CGO_LDFLAGS':flags,
           'GOPROXY':'off', 'GOSUMDB':'off'}
 pathlib.Path(build, 'remote.env').write_text(''.join('export '+k+'='+quote(v)+'\n' for k,v in values.items()))
 PY

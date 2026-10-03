@@ -68,8 +68,10 @@ rm -rf "$build/curl"
     -DHAVE_WRITABLE_ARGV="$writable" -DHAVE_TIME_T_UNSIGNED="$time_unsigned"
 "$cmake" --build "$build/curl" --target libcurl_static -j "$jobs"
 "$cmake" --install "$build/curl"
-python3 - "$build" "$prefix" "$np" "$writable" "$time_unsigned" "$sdk_cxx_runtime" "$sdk_platform" <<'PY'
+python3 -B - "$build" "$prefix" "$np" "$writable" "$time_unsigned" "$sdk_cxx_runtime" "$sdk_platform" "$root" <<'PY'
 import hashlib,json,pathlib,shlex,sys
+sys.path.insert(0, str(pathlib.Path(sys.argv[8])/'build'))
+from cgo_flags import join
 build,prefix,native=map(pathlib.Path,sys.argv[1:4])
 cache=(build/'curl/CMakeCache.txt').read_text()
 probes={'writable_argv':bool(int(sys.argv[4])), 'time_t_unsigned':bool(int(sys.argv[5])),
@@ -85,8 +87,8 @@ lib=prefix/'lib/libcurl.a'
 assert lib.is_file()
 values={'CURL_BUILD_DIR':str(build),'CURL_PREFIX':str(prefix),
         'CURL_INCLUDE_DIR':str(prefix/'include'),'CURL_STATIC_LIBRARY':str(lib),
-        'CURL_CPPFLAGS':'-DCURL_STATICLIB -I'+shlex.quote(str(prefix/'include')),
-        'CURL_LDFLAGS':shlex.quote(str(lib))}
+        'CURL_CPPFLAGS':join(['-DCURL_STATICLIB', '-I'+str(prefix/'include')]),
+        'CURL_LDFLAGS':join([str(lib)])}
 (build/'curl-deps.env').write_text(''.join('export '+k+'='+shlex.quote(v)+'\n' for k,v in values.items()))
 cm=('find_package(Threads REQUIRED)\n'
     'if(NOT TARGET OhecoCurl::curl)\n  add_library(OhecoCurl::curl STATIC IMPORTED)\n'

@@ -14,13 +14,7 @@ oheco-broker --help
 oheco-broker-server --help
 ```
 
-SDK 也提供独立源码项目，可导出到可编辑目录：
-
-```sh
-oo export oheco-broker@0.3.0 sdk --output './Broker SDK'
-```
-
-源码项目包含完整固定依赖、构建资源和许可证，由使用者在目标平台离线构建。
+安装包中的 `sdk/` 包含 C、Go、.NET 源码，可直接从安装目录使用。需要独立可编辑副本时，从 [Release](https://github.com/oheco/oheco-broker/releases/tag/v0.3.0) 下载 SDK 源码附件并解压。源码随附完整固定依赖、构建资源和许可证，由使用者在目标平台离线构建。
 
 客户端入口 `bin/oheco-broker` 是可迁移的 shell 启动器，运行已签名的 `libexec/oheco-broker`，并为它配置随包的 `lib/runtime/libc++_shared.so`。独立 `bin/oheco-broker-server` 是已签名 ELF，只依赖系统 C 运行库。安装不会自动启动或部署服务。
 

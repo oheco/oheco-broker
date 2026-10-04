@@ -47,8 +47,8 @@ python3 tests/production_acceptance.py \
 - 从独立 SDK 源码归档解压到含空格目录，完整离线构建成功；实际 Go native 链接及回环 HTTP 调用、C/.NET 源码消费通过。
 - 14829 个源码输入、固定清单、44 份许可 notice、完整 payload 摘要通过；第三方 fixture 原样保留。
 - 包迁移、双命令直接/PATH/版本及相对符号链接、无参数帮助、独立 SQLite/API 启动与 TERM、旧 shell managed/detached 生命周期通过。真实 GitHub 查询经代理通过。
-- [目录提交](https://github.com/oheco/oheco-packages/commit/c090679f4ea7e22c0761471b471cec73a2b8a148)及[Pages 工作流](https://github.com/oheco/oheco-packages/actions/runs/37156777249)成功；[正式索引](https://oheco.org/index/v5/index.json)显示 0.3.0、双命令和 `sdk` 源码项目。
-- `oo 0.10.0` 在隔离目录经正式索引完成 update、install、双命令/版本入口、switch、含空格中文路径 SDK export、全部导出 payload 摘要与 remove。导出无应用二进制，卸载后命令链接和安装目录清除。没有连接或修改生产实例。
+- [首次目录提交](https://github.com/oheco/oheco-packages/commit/c090679f4ea7e22c0761471b471cec73a2b8a148)及[Pages 工作流](https://github.com/oheco/oheco-packages/actions/runs/37156777249)成功。该提交误把 SDK 登记为 DevEco `projects`，后续已撤销这项登记；SDK 应通过安装包源码目录或 Release 源码附件获取。
+- `oo 0.10.0` 在隔离目录经正式索引完成 update、install、双命令/版本入口、switch 和 remove；卸载后命令链接和安装目录清除。独立 SDK 归档的全部 payload 摘要及源码布局验证通过。首次执行的 SDK 项目导出虽然运行成功，但不符合 DevEco 项目规范，不计入 SDK 交付方式。没有连接或修改生产实例。
 
 [Release](https://github.com/oheco/oheco-broker/releases/tag/v0.3.0)已正式发布并设为 Latest，上传附件的远端大小和服务端 SHA-256 与本地一致：
 

@@ -28,7 +28,8 @@ RUNTIME_BINARIES = {"bin/oheco-broker", "bin/oheco-broker-server", "libexec/ohec
                     "lib/runtime/libc++_shared.so"}
 README = """# oheco-broker 0.3.0 source SDKs
 
-This project archive is intended for `oo export oheco-broker@0.3.0 sdk`.
+Download this source SDK attachment from the GitHub Release and extract it
+into an editable directory. The installed runtime package also includes SDK sources.
 It contains complete C, Go and .NET SDK sources, pinned third-party source
 fixtures, manifests, patches, licenses and offline build resources. Build output
 belongs in a separate private temporary/cache directory. The SDK directories and
@@ -67,7 +68,7 @@ archives; they are test data, not SDK build outputs or personal signing material
 
 `BUILDINFO.txt` preserves the validated SDK source commit and identifies the
 runtime archive from which these bytes were derived. `SHA256SUMS` checks every
-file in this source project. Preserve `LICENSE`, dependency source notices,
+file in this source SDK archive. Preserve `LICENSE`, dependency source notices,
 `licenses`, `LICENSES.json` and `THIRD-PARTY-NOTICES.txt`. SDK builds are offline;
 no account configuration, personal credentials or local SDK installation paths
 are embedded in this archive. Application/server source and the full test suite

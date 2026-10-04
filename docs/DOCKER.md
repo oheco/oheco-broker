@@ -283,3 +283,21 @@ Compose 示例给出 1 CPU、512 MiB 内存、128 个进程上限和每个服务
 更新前保存一致的 SQLite 备份，并单独保护管理员 token、ACME 缓存或外部 issuer 的账号／证书、CLI 账号配置。可停止服务后备份整个状态目录，或由受控备份工具使用 SQLite backup API；不要在服务写入时只复制数据库主文件。拉取已验证的新镜像后用同一 Compose／环境文件 `up -d` 替换容器，保留 bind 目录；数据库有迁移时回滚同时需要兼容旧程序的一致备份。`docker compose down` 不删除宿主 bind 数据。
 
 部署后验证受信 HTTPS/WSS、UDP STUN、审批及独立 relay 权限，再从真实客户端检查 direct 与 `force` 的 TCP／UDP 数据、relay 用量和清理。`server_ready` 或容器运行状态不能证明公网防火墙、端口转发和 peer 路径通过。更多边界与验收见[通用部署](PRODUCTION-DEPLOYMENT.md)和[验收索引](LOCAL-VALIDATION.md)。
+
+## 维护者构建与发布
+
+[Docker 工作流](../.github/workflows/docker.yml)在两种原生 Linux runner 上分别构建和验收，随后加载原样保存的已验收镜像发布 GHCR，多架构索引不重新构建应用。PR 执行构建验收；新 `v*` 标签自动发布；手动触发的 `version` 始终选择既有应用标签 `vVERSION`，构建配方取所触发的工作流提交，并分别记录 revision。
+
+可选 `image_tag` 留空时使用应用版本，只允许显式指定同一应用版本或 `VERSION-docker.N`（`N` 为正整数）。例如维护容器配方时选择 `0.3.0-docker.1`，源码仍取不可变的 `v0.3.0`，两种程序的版本及 OCI 应用版本标签仍为 `0.3.0`。镜像已有版本／修订标签拒绝覆盖；不移动应用 Git 标签，也不替换已发布的 `0.3.0` 镜像。匿名验证同样接受 `image_tag`，拉取所选镜像标签并核对原应用版本／源码 revision。
+
+```sh
+# 未来配方修订示例；默认 publish=false，两种架构必须全部通过才发布。
+gh workflow run docker.yml --repo oheco/oheco-broker --ref main \
+  -f version=0.3.0 -f image_tag=0.3.0-docker.1 -F publish=true
+
+# 验证现有镜像的匿名拉取和两架构实际执行，不重建或覆盖镜像。
+gh workflow run docker.yml --repo oheco/oheco-broker --ref main \
+  -f version=0.3.0 -F verify_only=true
+```
+
+GitHub 首次创建 GHCR 包默认私有，仓库本身公开不会自动改变包可见性。包管理员需在[包设置](https://github.com/orgs/oheco/packages/container/oheco-broker/settings)的 **Change visibility → Public** 完成一次公开设置，然后运行上面的匿名验证。发布凭据使用 Actions `GITHUB_TOKEN` 的 `packages: write`，不需要 Docker Hub 密码；匿名验证使用空 Docker 凭据目录。GitHub 目前[通过包设置网页管理可见性](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility#configuring-visibility-of-packages-for-an-organization)，REST API 不提供此修改接口。

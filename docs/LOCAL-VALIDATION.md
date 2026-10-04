@@ -60,3 +60,24 @@ python3 tests/production_acceptance.py \
 SDK 分发更正由[目录提交](https://github.com/oheco/oheco-packages/commit/2e794b1581c565d9eda4f1b93db81b6d300a600d)及[Pages 工作流](https://github.com/oheco/oheco-packages/actions/runs/37171686574)部署。正式索引已撤销 SDK 的 `projects`，回到 schema v2；通过更正后的正式索引重新完成隔离安装、双命令版本、安装目录内 C/Go/.NET 源码与离线输入、卸载验证。SDK 源码通过安装目录或 Release 附件获取。
 
 独立 SDK 附件的原始 README 中误写了 DevEco 导出用法，Release 说明及当前源码文档已明确更正。后续提交修正文档、登记和验收记录，不改变已发布源码 SDK、运行包、标签或附件字节。
+
+## Linux Docker 0.3.0
+
+2026-10-04 的[双架构原生工作流](https://github.com/oheco/oheco-broker/actions/runs/37175665476)全部通过：AMD64 使用 `ubuntu-24.04`，ARM64 使用 `ubuntu-24.04-arm`。应用源码为现有 `v0.3.0` 的 `aecc2fd8247aec361e5573412b7bfd6e75a83127`，Docker 构建配方为 `abae42826554fa978e9e612421975452277eef0e`；基础镜像固定 Go 1.27.1 Bookworm、Debian Bookworm slim 的双架构索引摘要。Go vendor 和 C SDK 源码依赖离线构建，系统工具和运行库由 Bookworm APT 提供。
+
+- 两个架构分别完成完整 Go 测试、vet、原生 C/API/WS/WSS/direct/TURN 与 CLI、peer 生命周期验收，随后测试实际精简运行镜像。
+- 实际容器验证两个程序版本、动态依赖、CA 信任、UID 10001、只读根、私有 SQLite 和 token 权限、管理认证、默认审批与独立 relay 授权；CLI 执行 direct 与强制 TURN 的 TCP/UDP 数据传输和实际 relay 计数。
+- SQLite、CLI 配置和缓存在重建后保留，服务端作为 PID 1 接收 TERM 后在 15 秒内正常退出。静态证书 HTTPS TCP 3478 与 STUN/TURN UDP 3478 同时通过。
+- 非 root、零 capabilities、no-new-privileges 的低端口负例在容器阈值 1024 时明确拒绝绑定 443；桥接网络阈值 0 的正例实际发布宿主 TCP 443 到容器 TCP 443并通过受信 HTTPS。只修改容器网络命名空间，不修改宿主 sysctl。
+- ACME provider 的本地签发／续期 fixture 随 Go 测试通过。容器验收使用本地证书验证端口和持久化，不声称在用户域名或生产服务器上完成公有 CA 签发。
+
+两个已验收的镜像由原生 runner 保存，发布阶段直接载入并推送，不重新构建。`ghcr.io/oheco/oheco-broker:0.3.0` 与 `latest` 使用同一索引 `sha256:5e3890c7d388161dd2db01d686032f2df5b19defe45d676294e8ed0884906f2e`：
+
+| 平台 | 镜像摘要 |
+|---|---|
+| linux/amd64 | `sha256:6b8f46213fcde8087bafda19e51343d275980f20b5352b4a0b4e517d5ddebaf1` |
+| linux/arm64 | `sha256:b51ddb0d6f2b1d5e4813a4d36f9d71553de24ae55cb8106d4e85f7937fdbbedc` |
+
+初次推送后的 GHCR 包为私有可见性，匿名 registry token 请求实测 HTTP 401。包管理员已在网页中切换 Public，随后不使用账号凭据获取 registry token、`0.3.0`／`latest` 索引、两架构 manifest 与配置 blob，逐项核对 SHA-256、Linux 架构、应用版本、源码 revision 和 UID；`0.3.0`／`latest` 索引与上述发布摘要完全相同。部署方式见[Docker 部署](DOCKER.md)。
+
+[目录提交](https://github.com/oheco/oheco-packages/commit/64ee85b69785b235757a2fedb1a15dfc53ff549d)补充 Docker 和两种 TLS 部署入口，[Pages 工作流](https://github.com/oheco/oheco-packages/actions/runs/37176912411)成功，正式网站与 v5 索引中的说明已复核。此次只更新 notes，所有原有运行包 URL、大小、摘要、命令映射、schema 和 latest 保持一致。

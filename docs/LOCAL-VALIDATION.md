@@ -78,6 +78,8 @@ SDK 分发更正由[目录提交](https://github.com/oheco/oheco-packages/commit
 | linux/amd64 | `sha256:6b8f46213fcde8087bafda19e51343d275980f20b5352b4a0b4e517d5ddebaf1` |
 | linux/arm64 | `sha256:b51ddb0d6f2b1d5e4813a4d36f9d71553de24ae55cb8106d4e85f7937fdbbedc` |
 
-初次推送后的 GHCR 包为私有可见性，匿名 registry token 请求实测 HTTP 401。包管理员已在网页中切换 Public，随后不使用账号凭据获取 registry token、`0.3.0`／`latest` 索引、两架构 manifest 与配置 blob，逐项核对 SHA-256、Linux 架构、应用版本、源码 revision 和 UID；`0.3.0`／`latest` 索引与上述发布摘要完全相同。部署方式见[Docker 部署](DOCKER.md)。
+初次推送后的 GHCR 包为私有可见性，匿名 registry token 请求实测 HTTP 401。包管理员已在网页中切换 Public，随后不使用账号凭据获取 registry token、`0.3.0`／`latest` 索引、两架构 manifest 与配置 blob，逐项核对 SHA-256、Linux 架构、应用版本、源码 revision 和 UID；`0.3.0`／`latest` 索引与上述发布摘要完全相同。
+
+[匿名 Docker 拉取复核](https://github.com/oheco/oheco-broker/actions/runs/37177139985)在 AMD64 和 ARM64 原生 Linux runner 上分别通过：空 `DOCKER_CONFIG`、无登录凭据，实际 `docker pull` 后运行独立服务端和完整 CLI 的版本命令，核对两架构、应用源码标签和 `RepoDigests`，确认所拉取的索引仍为 `sha256:5e3890c7d388161dd2db01d686032f2df5b19defe45d676294e8ed0884906f2e`；验证步骤没有重新构建或覆盖镜像。部署方式见[Docker 部署](DOCKER.md)。
 
 [目录提交](https://github.com/oheco/oheco-packages/commit/64ee85b69785b235757a2fedb1a15dfc53ff549d)补充 Docker 和两种 TLS 部署入口，[Pages 工作流](https://github.com/oheco/oheco-packages/actions/runs/37176912411)成功，正式网站与 v5 索引中的说明已复核。此次只更新 notes，所有原有运行包 URL、大小、摘要、命令映射、schema 和 latest 保持一致。

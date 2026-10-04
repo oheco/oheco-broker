@@ -552,6 +552,10 @@ func TestDailyQuotaIncludesPendingAndUTCReset(t *testing.T) {
 	if _, e := s.db.Exec("UPDATE usage_daily SET day=? WHERE tenant_id=?", time.Now().UTC().Add(-24*time.Hour).Format("2006-01-02"), id); e != nil {
 		t.Fatal(e)
 	}
+	// The background refresh observes changes made outside usage accounting.
+	if e := s.refreshTURNQuotaUsage(context.Background()); e != nil {
+		t.Fatal(e)
+	}
 	if !s.authorizeTURN(id, broker, sid) {
 		t.Fatal("daily quota did not reset for a new UTC day")
 	}

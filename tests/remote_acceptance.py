@@ -56,8 +56,15 @@ def main():
                     process.wait(timeout=5)
                     raise AssertionError("test-owned process failed graceful shutdown")
         def run(command, label, timeout=150, input_text=None):
-            result = subprocess.run(command, env=env, cwd=root, capture_output=True,
-                                    text=True, input=input_text, timeout=timeout)
+            try:
+                result = subprocess.run(command, env=env, cwd=root, capture_output=True,
+                                        text=True, input=input_text, timeout=timeout)
+            except subprocess.TimeoutExpired as error:
+                def partial_text(value):
+                    return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value or ""
+                details = (partial_text(error.stdout) + partial_text(error.stderr)).replace(admin, "[admin-redacted]")
+                (root / (label + ".log")).write_text(details)
+                raise AssertionError(f"{label} exceeded {timeout}s: " + details) from error
             (root / (label + ".log")).write_text(result.stdout + result.stderr)
             if result.returncode:
                 # Redact test secrets in diagnostics; local artifacts are cleaned.
@@ -138,7 +145,11 @@ def main():
                     return json.load(response)
             before_ws = signaling_counters()
             run([args.native, url], "C authenticated direct TCP UDP mapping")
-            run([args.native, url, "--force", "--idle"], "C authenticated actual Pion TURN idle and TCP UDP mapping")
+            # This case deliberately spends 100 seconds idle. A normal release
+            # run took 141.744s, leaving only 8s under the generic 150s limit.
+            # Keep socket/UDP deadlines and assertions; allow setup and teardown
+            # their own bounded headroom outside that intentional idle period.
+            run([args.native, url, "--force", "--idle"], "C authenticated actual Pion TURN idle and TCP UDP mapping", timeout=210)
             account_path = config / "oheco-broker" / "account.json"
             base = [args.binary, "--api", url]
             registered = json.loads(run(base + ["tenant", "register", "--email", "local@example.invalid"], "CLI account registration"))

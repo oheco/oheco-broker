@@ -53,17 +53,20 @@ type Config struct {
 }
 
 type Server struct {
-	cfg          Config
-	db           *sql.DB
-	mux          *http.ServeMux
-	turn         *turnManager
-	ws           *wsHub
-	stop         chan struct{}
-	done         chan struct{}
-	closeOnce    sync.Once
-	closeErr     error
-	usageMu      sync.Mutex
-	pendingUsage map[string]int64 // tenant UUID + UTC minute bucket
+	cfg            Config
+	db             *sql.DB
+	turnAuthStmt   *sql.Stmt
+	turnAuthCache  *turnAuthorizationCache
+	turnQuotaCache *turnQuotaCache
+	mux            *http.ServeMux
+	turn           *turnManager
+	ws             *wsHub
+	stop           chan struct{}
+	done           chan struct{}
+	closeOnce      sync.Once
+	closeErr       error
+	usageMu        sync.Mutex
+	pendingUsage   map[string]int64 // tenant UUID + UTC minute bucket
 }
 
 type Tenant struct {
@@ -204,9 +207,25 @@ func New(cfg Config) (*Server, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	// Reuse the authorization query plan, while reading current rows for every
+	// packet. Preparing this joined query per packet dominates TURN CPU cost.
+	s.turnAuthStmt, err = db.Prepare(turnAuthorizationIdentitySQL)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	s.turnQuotaCache = newTURNQuotaCache()
+	if err = s.refreshTURNQuotaUsage(context.Background()); err != nil {
+		_ = s.turnAuthStmt.Close()
+		_ = db.Close()
+		return nil, err
+	}
+	s.turnAuthCache = newTURNAuthorizationCache(s)
 	if cfg.TURN.Enabled {
 		s.turn, err = startTURN(cfg.TURN, s.authorizeTURN, s.recordRelayUsage)
 		if err != nil {
+			s.turnAuthCache.close()
+			_ = s.turnAuthStmt.Close()
 			_ = db.Close()
 			return nil, err
 		}
@@ -249,6 +268,7 @@ func (s *Server) turnRenewalMode() string {
 func (s *Server) Close() error {
 	s.closeOnce.Do(func() {
 		close(s.stop)
+		s.turnAuthCache.close()
 		// HTTP Shutdown does not own hijacked connections. Join all WS readers,
 		// writers and scope loops while their SQLite authorization is still live.
 		s.ws.close()
@@ -257,6 +277,9 @@ func (s *Server) Close() error {
 		}
 		<-s.done
 		if err := s.flushUsage(); err != nil && s.closeErr == nil {
+			s.closeErr = err
+		}
+		if err := s.turnAuthStmt.Close(); err != nil && s.closeErr == nil {
 			s.closeErr = err
 		}
 		if err := s.db.Close(); err != nil && s.closeErr == nil {
@@ -593,11 +616,13 @@ func (s *Server) revokeTenant(id string) {
 	s.notifyWSTenant(id)
 }
 func (s *Server) revokeTURNTenant(id string) {
+	s.turnAuthCache.invalidateTenant(id)
 	if s.turn != nil {
 		s.turn.revokeTenant(id)
 	}
 }
 func (s *Server) revokeBroker(id string) {
+	s.turnAuthCache.invalidateBroker(id)
 	if s.turn != nil {
 		s.turn.revokeBroker(id)
 	}
@@ -608,6 +633,7 @@ func (s *Server) revokeSession(id string) {
 	s.notifyWSSession(id)
 }
 func (s *Server) revokeTURNSession(id string) {
+	s.turnAuthCache.invalidateSession(id)
 	if s.turn != nil {
 		s.turn.revokeSession(id)
 	}
@@ -641,9 +667,11 @@ func (s *Server) recordRelayUsage(tenant, broker, session string, n int64) {
 	if n <= 0 {
 		return
 	}
-	key := tenant + "|" + broker + "|" + time.Now().UTC().Truncate(time.Minute).Format(time.RFC3339)
+	bucket := time.Now().UTC().Truncate(time.Minute).Format(time.RFC3339)
+	key := tenant + "|" + broker + "|" + bucket
 	s.usageMu.Lock()
 	s.pendingUsage[key] += n
+	s.recordTURNQuotaUsageLocked(tenant, bucket[:10], n)
 	s.usageMu.Unlock()
 }
 func (s *Server) flushUsage() error {
@@ -724,38 +752,7 @@ func (s *Server) flushUsage() error {
 	return nil
 }
 func (s *Server) authorizeTURN(tenant, broker, session string) bool {
-	t, _, e := s.tenant(tenant)
-	if e != nil || t.Status != "active" || !t.RelayEnabled {
-		return false
-	}
-	b, e := s.broker(broker)
-	if e != nil || b.TenantID != tenant || !b.Online {
-		return false
-	}
-	v, e := s.session(session)
-	if e != nil || s.managedSession(v) != nil || v.TenantID != tenant || v.BrokerID != broker || !v.PeerAuthenticated || !v.RelayApproved || v.RelayMode == "never" || !v.ExpiresAt.After(time.Now()) {
-		return false
-	}
-	if s.cfg.TenantDailyByteQuota > 0 {
-		day := time.Now().UTC().Format("2006-01-02")
-		var n int64
-		e = s.db.QueryRow("SELECT COALESCE(SUM(bytes),0) FROM usage_daily WHERE tenant_id=? AND day=?", tenant, day).Scan(&n)
-		if e != nil {
-			return false
-		}
-		s.usageMu.Lock()
-		for key, bytes := range s.pendingUsage {
-			parts := strings.SplitN(key, "|", 3)
-			if parts[0] == tenant && strings.HasPrefix(parts[2], day) {
-				n += bytes
-			}
-		}
-		s.usageMu.Unlock()
-		if n >= s.cfg.TenantDailyByteQuota {
-			return false
-		}
-	}
-	return true
+	return s.turnAuthCache.authorize(tenant, broker, session) && s.authorizeTURNQuota(tenant)
 }
 
 // Serve runs an HTTP server using Config.ListenAddr. Embedders can instead use Handler.

@@ -47,6 +47,7 @@ class Driver:
     def __init__(self, command, env, root, label, redact):
         self.condition = threading.Condition()
         self.events = []
+        self.event_times = []
         self.lines = []
         self.redact = redact
         self.stderr = (root / (label + ".stderr")).open("w+")
@@ -66,6 +67,7 @@ class Driver:
                     event = None
                 if isinstance(event, dict):
                     self.events.append(event)
+                    self.event_times.append(time.monotonic())
                 self.condition.notify_all()
         with self.condition:
             self.condition.notify_all()
@@ -73,6 +75,13 @@ class Driver:
     def mark(self):
         with self.condition:
             return len(self.events)
+
+    def observed_at(self, event):
+        with self.condition:
+            for index, item in enumerate(self.events):
+                if item is event:
+                    return self.event_times[index]
+        raise AssertionError("event has no reader timestamp")
 
     def command(self, text):
         self.process.stdin.write(text + "\n")
@@ -440,7 +449,7 @@ def main():
                 workers = [threading.Thread(target=action, daemon=True) for action in (send_uploads, send_downloads, receive_frames)]
                 for worker in workers:
                     worker.start()
-                client.wait(lambda item: item.get("event") == "state" and item.get("state") in (RECONNECTING, RETRY_WAIT), mark, 45)
+                first_disconnect = client.wait(lambda item: item.get("event") == "state" and item.get("state") in (RECONNECTING, RETRY_WAIT), mark, 45)
                 restore()
                 recovered = client.wait(lambda item: item.get("event") == "state" and item.get("state") == CONNECTED and item.get("generation", 0) > before_state["generation"], mark, 30)
                 # TURN carries both the 4MiB independent download and the 4MiB
@@ -462,14 +471,27 @@ def main():
                 print(json.dumps({"event":"transfer_complete", "relay":relay_mode, "elapsed_seconds":round(time.monotonic()-transfer_started,3), "progress":progress}), flush=True)
                 print(f"PASS relay={relay_mode} automatic UDP-blackhole recovery on SAME TCP fd/target socket; 4MiB each direction exact once; stable maps/ports", flush=True)
 
+                before_second_fault = client.state()
                 mark = client.mark()
                 blackhole(mapping)
-                paused = client.wait(lambda item: item.get("event") == "state" and item.get("state") == PAUSED, mark, 50)
+                second_disconnect = client.wait(lambda item: item.get("event") == "state" and item.get("state") in (RECONNECTING, RETRY_WAIT, PAUSED), mark, 45)
+                paused = second_disconnect if second_disconnect["state"] == PAUSED else client.wait(lambda item: item.get("event") == "state" and item.get("state") == PAUSED, mark, 50)
                 print(json.dumps({"event":"flow_stage", "phase":"paused_after_retry_exhaustion", "observed_at":time.monotonic(),
                     "target_closed_at":flow.closed_at, "target_half_closed_at":flow.half_closed_at,
                     "target_closed":flow.closed.is_set(), "target_half_closed":flow.half_closed.is_set()}), flush=True)
-                if paused["attempts"] < 2:
-                    raise AssertionError("automatic retry policy did not exhaust")
+                # The driver configures max_attempts=2 and retry_budget_ms=12000;
+                # setup_timeout_ms=8000 bounds each attempt. A flicker before the
+                # 30s stable reset retains the original outage clock and attempts.
+                budget_origin = first_disconnect if before_second_fault["attempts"] else second_disconnect
+                budget_elapsed = client.observed_at(paused) - client.observed_at(budget_origin)
+                if not 1 <= paused["attempts"] <= 2:
+                    raise AssertionError("automatic retry attempt bound was not respected")
+                if paused["attempts"] < 2 and budget_elapsed < 11.5:
+                    raise AssertionError("automatic retries paused before both attempt and 12s budget limits")
+                print(json.dumps({"event":"retry_exhaustion", "relay":relay_mode,
+                    "attempts":paused["attempts"], "retained_attempts":before_second_fault["attempts"],
+                    "budget_ms":12000, "budget_elapsed_seconds":round(budget_elapsed,3),
+                    "reason":"attempt_limit" if paused["attempts"] == 2 else "time_budget"}), flush=True)
                 stale = b"stale-" + secrets.token_bytes(32)
                 for _ in range(20):
                     udp.send(stale)

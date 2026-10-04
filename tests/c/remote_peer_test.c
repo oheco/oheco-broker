@@ -19,7 +19,7 @@
 #include <errno.h>
 #include <time.h>
 #include "peer_policy_test.c"
-struct echo { int fd, udp; uint16_t port; pthread_t thread; atomic_int stop; };
+struct echo { int fd, udp; uint16_t port; pthread_t thread; atomic_int stop; atomic_uint udp_received, udp_echoed; atomic_int udp_last_error; };
 static void pause_ms(unsigned n)
 { struct timespec t = {n/1000, (long)(n%1000)*1000000}; while(nanosleep(&t,&t)&&errno==EINTR){} }
 static void timeout(int fd)
@@ -39,7 +39,12 @@ static void *echo_worker(void *data)
         if (poll(&pollfd,1,100) <= 0) continue;
         if (e->udp) { struct sockaddr_storage addr; socklen_t len = sizeof(addr);
             ssize_t n = recvfrom(e->fd,bytes,sizeof(bytes),0,(struct sockaddr *)&addr,&len);
-            if (n >= 0) sendto(e->fd,bytes,(size_t)n,0,(struct sockaddr *)&addr,len);
+            if (n >= 0) {
+                atomic_fetch_add(&e->udp_received,1);
+                ssize_t echoed=sendto(e->fd,bytes,(size_t)n,0,(struct sockaddr *)&addr,len);
+                atomic_store(&e->udp_last_error,echoed<0?errno:0);
+                if(echoed==n)atomic_fetch_add(&e->udp_echoed,1);
+            }
         } else {
             int fd = accept(e->fd,NULL,NULL); if (fd < 0) continue; timeout(fd);
             while (!atomic_load(&e->stop)) {
@@ -86,24 +91,35 @@ static int tcp_check(uint16_t port)
     result=0;
 done: close(fd); return result;
 }
-static int udp_check(uint16_t port)
+static int udp_check(uint16_t port, ob_remote_peer *peer, ob_remote_server *server, struct echo *target)
 {
+    const char *stage="socket"; ssize_t n=-1; size_t wanted=0;
     int a=connected(port,1), b=connected(port,1), result=-1;
     unsigned char *sent=malloc(65507), *received=malloc(65507);
     if (a<0 || b<0 || !sent || !received) goto done;
     const char one[]="source-a",two[]="source-b";
-    if (send(a,one,sizeof(one),0)!=(ssize_t)sizeof(one) || send(b,two,sizeof(two),0)!=(ssize_t)sizeof(two)) goto done;
-    ssize_t n=recv(b,received,65507,0); if(n!=(ssize_t)sizeof(two)||memcmp(two,received,sizeof(two)))goto done;
-    n=recv(a,received,65507,0); if(n!=(ssize_t)sizeof(one)||memcmp(one,received,sizeof(one)))goto done;
-    if(send(a,"",0,0)!=0 || recv(a,received,65507,0)!=0)goto done;
+    stage="source-a-send";wanted=sizeof(one);n=send(a,one,sizeof(one),0);if(n!=(ssize_t)sizeof(one))goto done;
+    stage="source-b-send";wanted=sizeof(two);n=send(b,two,sizeof(two),0);if(n!=(ssize_t)sizeof(two))goto done;
+    stage="source-b-recv";wanted=sizeof(two);n=recv(b,received,65507,0); if(n!=(ssize_t)sizeof(two)||memcmp(two,received,sizeof(two)))goto done;
+    stage="source-a-recv";wanted=sizeof(one);n=recv(a,received,65507,0); if(n!=(ssize_t)sizeof(one)||memcmp(one,received,sizeof(one)))goto done;
+    stage="zero-send";wanted=0;n=send(a,"",0,0);if(n!=0)goto done;
+    stage="zero-recv";n=recv(a,received,65507,0);if(n!=0)goto done;
     const size_t lengths[]={512,513,16384,65507};
     for(size_t t=0;t<sizeof(lengths)/sizeof(lengths[0]);++t){size_t size=lengths[t];
         for(size_t i=0;i<size;++i)sent[i]=(unsigned char)(i*7+t);
-        if(send(a,sent,size,0)!=(ssize_t)size)goto done;
-        n=recv(a,received,65507,0); if(n!=(ssize_t)size||memcmp(sent,received,size))goto done;
+        stage="payload-send";wanted=size;n=send(a,sent,size,0);if(n!=(ssize_t)size)goto done;
+        stage="payload-recv";n=recv(a,received,65507,0); if(n!=(ssize_t)size||memcmp(sent,received,size))goto done;
     }
     result=0;
-done: if(a>=0)close(a);if(b>=0)close(b);free(sent);free(received);return result;
+done:
+    if(result){
+        int saved_errno=n<0?errno:0;ob_remote_connection_info pi={0},si={0};
+        int pr=ob_remote_peer_get_state(peer,&pi),sr=ob_remote_server_get_state(server,&si);
+        fprintf(stderr,"UDP diagnostic stage=%s expected=%zu n=%zd errno=%d target_received=%u target_echoed=%u target_errno=%d peer_rc=%d peer_state=%d peer_generation=%llu peer_attempts=%u server_rc=%d server_state=%d server_generation=%llu server_attempts=%u\n",
+            stage,wanted,n,saved_errno,atomic_load(&target->udp_received),atomic_load(&target->udp_echoed),atomic_load(&target->udp_last_error),
+            pr,(int)pi.state,(unsigned long long)pi.generation,pi.attempts,sr,(int)si.state,(unsigned long long)si.generation,si.attempts);
+    }
+    if(a>=0)close(a);if(b>=0)close(b);free(sent);free(received);return result;
 }
 static char *test_signal(const char *sid, const unsigned char key[32],
                           double version, double sequence, const char *type, const char *payload)
@@ -273,7 +289,7 @@ int main(int argc,char **argv)
         ||ob_remote_portmap_udp(peer,NULL,0,"127.0.0.1",udp.port,&maps[2],&error))goto done;
     if(tcp_check(ob_remote_map_local_port(maps[0]))||tcp_check(ob_remote_map_local_port(maps[1]))){fprintf(stderr,"FAIL TCP echo/FIN\n");goto done;}
     printf("PASS multiple TCP mappings 512KiB bidirectional echo and FIN\n");
-    if(udp_check(ob_remote_map_local_port(maps[2]))){fprintf(stderr,"FAIL UDP sources/zero/fragmentation\n");goto done;}
+    if(udp_check(ob_remote_map_local_port(maps[2]),peer,server,&udp)){fprintf(stderr,"FAIL UDP sources/zero/fragmentation\n");goto done;}
     printf("PASS UDP source isolation, zero-length, 512/513/16384/65507-byte fragments\n");
     /* A valid authenticated peer still cannot open an unlisted target port. */
     uint16_t denied=tcp.port==65535?1:(uint16_t)(tcp.port+1);

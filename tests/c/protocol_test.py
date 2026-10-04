@@ -3,6 +3,7 @@
 Usage: python3 tests/c/protocol_test.py /absolute/path/to/broker-smoke
 No real broker is needed. All files are isolated under TMPDIR and removed.
 """
+import errno
 import os
 import socket
 import struct
@@ -36,6 +37,15 @@ def exact(conn, size):
     return data
 
 
+def shutdown_write(conn):
+    try:
+        conn.shutdown(socket.SHUT_WR)
+    except OSError as exc:
+        # A malformed reply can make the C client close before fixture teardown.
+        if exc.errno != errno.ENOTCONN:
+            raise
+
+
 def wire_test(binary, root, name, reply, expected=None, handshake=True, delay=0,
               mode="run", chunk_delay=0.01, log_paths=("日志/输出", "")):
     failures = []
@@ -59,7 +69,7 @@ def wire_test(binary, root, name, reply, expected=None, handshake=True, delay=0,
                         time.sleep(delay)
                         if reply:
                             conn.sendall(reply)
-                        conn.shutdown(socket.SHUT_WR)
+                        shutdown_write(conn)
                         assert conn.recv(1) == b"", "START sent after failed greeting"
                     else:
                         # Fragment the detached greeting as well as selected ACKs.
@@ -84,7 +94,7 @@ def wire_test(binary, root, name, reply, expected=None, handshake=True, delay=0,
                             conn.sendall(reply)
                         if detached:
                             if not reply or (isinstance(reply, bytes) and len(reply) < 9):
-                                conn.shutdown(socket.SHUT_WR)
+                                shutdown_write(conn)
                             assert conn.recv(1) == b"", "client sent control/fallback or waited for EOF"
                 # A second connection must never be used to retry or fall back.
                 listener.settimeout(0.2)

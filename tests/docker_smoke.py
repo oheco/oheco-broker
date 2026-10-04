@@ -261,7 +261,8 @@ class Smoke:
         settings = self.api("GET", "/v1/admin/settings", token=self.admin)
         require(settings == {"registration_policy": "approval", "registration_relay_enabled": False}, "unsafe initial registration defaults")
         info = self.api("GET", "/v1/admin/info", token=self.admin)
-        require(info["storage"] == "sqlite3" and info["schema_version"] == 1 and info["quic_termination"] is False, "not the SQLite standalone service")
+        expected_schema = 2 if tuple(map(int, self.args.expected_version.split("."))) >= (0, 4, 0) else 1
+        require(info["storage"] == "sqlite3" and info["schema_version"] == expected_schema and info["quic_termination"] is False, "not the SQLite standalone service")
         untrusted = self.docker("exec", server, "oheco-broker", "--api", self.api_url, "admin", "--token-file",
                                 SECRETS + "/admin.token", "info", check=False)
         require(untrusted.returncode != 0 and "remote:" in untrusted.stderr, "CLI accepted the untrusted fixture certificate")
@@ -520,8 +521,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", required=True)
     parser.add_argument("--expected-arch", choices=("amd64", "arm64"), required=True)
-    parser.add_argument("--expected-version", default="0.3.0")
-    parser.add_argument("--expected-revision", default="aecc2fd8247aec361e5573412b7bfd6e75a83127")
+    parser.add_argument("--expected-version", default="0.4.0")
+    parser.add_argument("--expected-revision", required=True)
     args = parser.parse_args()
     require(platform.system() == "Linux" and architecture(platform.machine()) == args.expected_arch,
             "this test requires the expected native Linux host; OHOS/QEMU is not Linux image verification")

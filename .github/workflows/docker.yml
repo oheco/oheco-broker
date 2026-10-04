@@ -1,0 +1,242 @@
+name: Build and publish Linux Docker images
+
+on:
+  pull_request:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Existing application release version (without v)'
+        required: true
+        default: '0.3.0'
+        type: string
+      publish:
+        description: 'Publish the verified multiarch image to GHCR'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-${{ inputs.version || github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/oheco/oheco-broker
+
+jobs:
+  build:
+    name: Native Linux ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare application source and Docker recipe
+        id: source
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          RECIPE_REVISION: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            source_ref="refs/tags/v$RELEASE_VERSION"
+          elif [[ "$REF" == refs/tags/v* ]]; then
+            RELEASE_VERSION="${REF#refs/tags/v}"
+            [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            source_ref="$REF"
+          else
+            source_ref=HEAD
+            RELEASE_VERSION=$(python3 -c 'import pathlib,re;print(re.search(r"const Version = \"([^\"]+)\"",pathlib.Path("cmd/oheco-broker-server/main.go").read_text())[1])')
+          fi
+          source_revision=$(git rev-parse "$source_ref^{commit}")
+          context="$RUNNER_TEMP/application"
+          mkdir -p "$context" "$RUNNER_TEMP/image-output"
+          git archive "$source_revision" | tar -x -C "$context"
+          cp Dockerfile .dockerignore "$context/"
+          printf 'version=%s\nrevision=%s\n' "$RELEASE_VERSION" "$source_revision" >> "$GITHUB_OUTPUT"
+          printf 'SOURCE_REVISION=%s\nAPP_VERSION=%s\n' "$source_revision" "$RELEASE_VERSION" >> "$GITHUB_ENV"
+          python3 - "$RUNNER_TEMP/image-output/metadata.json" "$RELEASE_VERSION" "$source_revision" "$RECIPE_REVISION" <<'PY'
+          import json,pathlib,sys
+          target,version,source,recipe=sys.argv[1:]
+          pathlib.Path(target).write_text(json.dumps({'version':version,'source_revision':source,'recipe_revision':recipe})+'\n')
+          PY
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Check the nonroot ACME privileged-port policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --user 10001:10001 --network bridge \
+            --sysctl net.ipv4.ip_unprivileged_port_start=1024 \
+            --cap-drop ALL --cap-add NET_BIND_SERVICE \
+            --security-opt no-new-privileges:true \
+            debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 \
+            sh -c 'grep "^CapEff:" /proc/self/status' > "$RUNNER_TEMP/image-output/bind-capability.log"
+          python3 - "$RUNNER_TEMP/image-output/bind-capability.log" <<'PY'
+          import pathlib,sys
+          value=int(pathlib.Path(sys.argv[1]).read_text().split()[1],16)
+          assert value == 1<<10, 'The nonroot ACME process must have only NET_BIND_SERVICE; received '+hex(value)
+          PY
+      - name: Build and run application tests on the native architecture
+        env:
+          ARCH: ${{ matrix.arch }}
+          RECIPE_REVISION: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build --platform "linux/$ARCH" --load \
+            --tag "oheco-broker-test:$ARCH" \
+            --build-arg "APP_VERSION=$APP_VERSION" \
+            --build-arg "SOURCE_REVISION=$SOURCE_REVISION" \
+            --label "org.oheco.build-recipe-revision=$RECIPE_REVISION" \
+            --cache-from "type=gha,scope=docker-$ARCH" \
+            --cache-to "type=gha,scope=docker-$ARCH,mode=max" \
+            "$RUNNER_TEMP/application" 2>&1 | tee "$RUNNER_TEMP/image-output/build.log"
+      - name: Verify container deployment and both native programs
+        env:
+          ARCH: ${{ matrix.arch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/docker_smoke.py --image "oheco-broker-test:$ARCH" \
+            --expected-arch "$ARCH" --expected-version "$APP_VERSION" \
+            --expected-revision "$SOURCE_REVISION" \
+            2>&1 | tee "$RUNNER_TEMP/image-output/smoke.log"
+      - name: Validate both Compose modes
+        shell: bash
+        run: |
+          set -euo pipefail
+          export BROKER_DOMAIN=example.org BROKER_PUBLIC_IPV4=192.0.2.1
+          export BROKER_ACME_ACCEPT_TOS=true
+          export BROKER_DATA_DIR="$RUNNER_TEMP/compose-data"
+          export BROKER_SECRETS_DIR="$RUNNER_TEMP/compose-secrets"
+          export BROKER_CERT_DIR="$RUNNER_TEMP/compose-certificates"
+          docker compose -f deploy/docker/compose.acme.yaml config --quiet
+          docker compose -f deploy/docker/compose.static.yaml config --quiet
+          unset BROKER_DOMAIN
+          if docker compose -f deploy/docker/compose.acme.yaml config --quiet; then
+            echo 'ACME configuration must require an explicit public domain' >&2
+            exit 1
+          fi
+      - name: Save verified image for publication
+        if: (github.event_name == 'workflow_dispatch' && inputs.publish) || startsWith(github.ref, 'refs/tags/v')
+        env:
+          ARCH: ${{ matrix.arch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker save "oheco-broker-test:$ARCH" | gzip -1 > "$RUNNER_TEMP/image-output/image.tar.gz"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: docker-${{ matrix.arch }}
+          path: ${{ runner.temp }}/image-output/
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    name: Publish verified multiarch image
+    needs: build
+    if: (github.event_name == 'workflow_dispatch' && inputs.publish) || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: docker-*
+          path: images
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Verify metadata agrees across architectures
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmp images/docker-amd64/metadata.json images/docker-arm64/metadata.json
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import json,pathlib
+          data=json.loads(pathlib.Path('images/docker-amd64/metadata.json').read_text())
+          print('APP_VERSION='+data['version'])
+          print('SOURCE_REVISION='+data['source_revision'])
+          PY
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Refuse to replace an existing release image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_USER: ${{ github.actor }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --user "$GH_USER:$GH_TOKEN" \
+            'https://ghcr.io/token?service=ghcr.io&scope=repository:oheco/oheco-broker:pull,push' > token.json
+          registry_token=$(python3 -c 'import json;print(json.load(open("token.json"))["token"])')
+          echo "::add-mask::$registry_token"
+          result=$(curl --silent --show-error --output existing-manifest.json --write-out '%{http_code}' \
+            --header "Authorization: Bearer $registry_token" \
+            --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+            "https://ghcr.io/v2/oheco/oheco-broker/manifests/$APP_VERSION")
+          rm token.json
+          if [[ "$result" != 404 ]]; then
+            echo "Cannot create immutable version $APP_VERSION: registry returned HTTP $result (200 means it already exists)." >&2
+            exit 1
+          fi
+      - name: Push both tested images and combine their digests
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sources=()
+          for arch in amd64 arm64; do
+            gzip -dc "images/docker-$arch/image.tar.gz" | docker load
+            temporary="$IMAGE:build-$RUN_ID-$RUN_ATTEMPT-$arch"
+            docker tag "oheco-broker-test:$arch" "$temporary"
+            docker push "$temporary" | tee "push-$arch.log"
+            digest=$(sed -n 's/.*digest: \(sha256:[0-9a-f]\{64\}\).*/\1/p' "push-$arch.log" | tail -1)
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            sources+=("$IMAGE@$digest")
+          done
+          docker buildx imagetools create --tag "$IMAGE:$APP_VERSION" "${sources[@]}"
+          docker buildx imagetools inspect "$IMAGE:$APP_VERSION" --raw > image-index.json
+          python3 - <<'PY'
+          import json,pathlib
+          data=json.loads(pathlib.Path('image-index.json').read_text())
+          platforms={(m['platform']['os'],m['platform']['architecture']) for m in data['manifests']}
+          assert platforms=={('linux','amd64'),('linux','arm64')},platforms
+          PY
+          docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE:$APP_VERSION"
+          {
+            echo "Published **$IMAGE:$APP_VERSION** and **$IMAGE:latest**."
+            echo
+            echo "Application source: $SOURCE_REVISION"
+            echo
+            docker buildx imagetools inspect "$IMAGE:$APP_VERSION"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: docker-published-index
+          path: image-index.json
+          retention-days: 30

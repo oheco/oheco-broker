@@ -1,0 +1,55 @@
+# Linux host networking: TCP 443 and UDP TURN/relay bind directly on the host.
+# Prepare the UID 10001 private bind directories first; see docs/DOCKER.md.
+services:
+  broker:
+    image: ${BROKER_IMAGE:-ghcr.io/oheco/oheco-broker:0.3.0}
+    user: "10001:10001"
+    network_mode: host
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777
+    environment:
+      XDG_CONFIG_HOME: /var/lib/oheco-broker/config
+    command:
+      - --listen=0.0.0.0:443
+      - --db=/var/lib/oheco-broker/db/control.sqlite
+      - --admin-token-file=/run/oheco-broker/secrets/admin.token
+      - --registration=approval
+      - --registration-relay=false
+      - --acme-domain=${BROKER_DOMAIN:?set the public DNS name}
+      - --acme-email=${BROKER_ACME_EMAIL:-}
+      - --acme-cache=/var/lib/oheco-broker/acme
+      - --acme-directory=${BROKER_ACME_DIRECTORY:-}
+      - --acme-accept-tos=${BROKER_ACME_ACCEPT_TOS:?set true after accepting the CA terms}
+      - --turn-listen=0.0.0.0:3478
+      - --turn-public-ip=${BROKER_PUBLIC_IPV4:?set the externally reachable IPv4}
+      - --turn-relay-min-port=${BROKER_RELAY_MIN_PORT:-50000}
+      - --turn-relay-max-port=${BROKER_RELAY_MAX_PORT:-50100}
+    volumes:
+      - type: bind
+        source: ${BROKER_DATA_DIR:?set the prepared absolute data directory}
+        target: /var/lib/oheco-broker
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${BROKER_SECRETS_DIR:?set the prepared absolute secrets directory}
+        target: /run/oheco-broker/secrets
+        read_only: true
+        bind:
+          create_host_path: false
+    cpus: "1.0"
+    mem_limit: 512m
+    pids_limit: 128
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

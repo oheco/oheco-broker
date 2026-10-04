@@ -35,6 +35,10 @@ oheco-broker tenant connect --name desktop --password-stdin \
 
 域名和目标是示例。无参数显示帮助；原本地命令执行服务通过 `oheco-broker shell serve` 显式启动。该子命令无鉴权，仅适用于可信本机开发。
 
+## Docker 部署
+
+Linux 镜像 `ghcr.io/oheco/oheco-broker:0.3.0` 同时提供独立服务端和 CLI，默认启动服务端。见 [Docker 部署说明](docs/DOCKER.md)：内置 ACME 通过主机 TCP 443 自动签发／续期；外部 acme.sh／Certbot 导出只读证书时，可用 HTTPS TCP 3478，与 TURN UDP 3478 及 relay 范围同时运行。
+
 ## 源码构建与测试
 
 完整 checkout 包含 Go `vendor/` 及 C `sdk/c/tpr/`，构建不下载依赖。HarmonyOS 构建需要原生 Go 1.25+、clang/clang++、CMake、Ninja、Python 和 `binary-sign-tool`；旧命令服务回归还需要 .NET 10。

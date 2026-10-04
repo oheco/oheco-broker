@@ -15,6 +15,39 @@
 #else
 #define M_TRACE(...) ((void)0)
 #endif
+#ifdef OB_UDP_TRACE
+#include <stdio.h>
+#include <stdatomic.h>
+#define U_TRACE_ROWS 2048U
+#define U_TRACE_WIDTH 320U
+static char ob_udp_trace_rows[2][U_TRACE_ROWS][U_TRACE_WIDTH];
+static atomic_uint ob_udp_trace_counts[2];
+/* Reserve a unique row without allocation or I/O. The diagnostic caller dumps
+ * only after every peer owner has joined, so row readers cannot race writers. */
+#define U_TRACE(format, role, ...) do { \
+    int ob_trace_errno = errno; \
+    unsigned int ob_trace_role = (unsigned int)(role); \
+    if (ob_trace_role < 2U) { \
+        unsigned int ob_trace_row = atomic_fetch_add_explicit(&ob_udp_trace_counts[ob_trace_role], 1U, memory_order_relaxed); \
+        if (ob_trace_row < U_TRACE_ROWS) \
+            (void)snprintf(ob_udp_trace_rows[ob_trace_role][ob_trace_row], U_TRACE_WIDTH, format, (int)ob_trace_role, __VA_ARGS__); \
+    } \
+    errno = ob_trace_errno; \
+} while (0)
+void ob_mapping_udp_trace_dump(void)
+{
+    int saved_errno = errno;
+    for (unsigned int role = 0; role < 2U; ++role) {
+        unsigned int count = atomic_load_explicit(&ob_udp_trace_counts[role], memory_order_relaxed);
+        unsigned int rows = count < U_TRACE_ROWS ? count : U_TRACE_ROWS;
+        fprintf(stderr, "udp buffered-summary role=%u rows=%u dropped_rows=%u\n", role, rows, count - rows);
+        for (unsigned int row = 0; row < rows; ++row) fputs(ob_udp_trace_rows[role][row], stderr);
+    }
+    errno = saved_errno;
+}
+#else
+#define U_TRACE(...) ((void)0)
+#endif
 
 /* Application wire protocol (all integers big endian):
  * OBM1, kind:u8, protocol:u8, size:u16, flow:u64, payload.
@@ -52,6 +85,62 @@
 #define M_PACKET_US UINT64_C(2000000)
 #define M_PACKET_TTL_US UINT64_C(1000000)
 #define M_IO_BUDGET 16384U
+
+#ifdef OB_UDP_COUNTERS
+#include <stdio.h>
+#include <stdatomic.h>
+struct ob_udp_counters {
+    atomic_uint_fast64_t enq_ok, enq_denied, send_flow, send_packet;
+    atomic_uint_fast64_t target_reads, target_n, send_attempts, admitted, eagain, negative, mss_drop;
+    atomic_int_fast64_t last_rc;
+    atomic_uint_fast64_t sent_bits[2], sent_ids[128];
+    atomic_uint_fast64_t ttl_expired, ttl_offset, recv_flow, recv_packet, recv_fragments, recv_bytes, recv_bits[2];
+    atomic_uint_fast64_t incomplete_drops, drop_received, drop_bits[2], deliveries;
+    atomic_int_fast64_t delivery_n;
+    atomic_uint_fast64_t delivery_errno, lost_count, lost_ids[128];
+};
+static struct ob_udp_counters ob_udp_counters[2];
+_Static_assert(sizeof(ob_udp_counters) <= 8192U, "UDP diagnostic counters must stay within 8KiB BSS");
+#define UC_GET(p) (&ob_udp_counters[(p)->is_server ? 1U : 0U])
+#define UC_ADD(p, field, value) ((void)atomic_fetch_add_explicit(&UC_GET(p)->field, (value), memory_order_relaxed))
+#define UC_SET(p, field, value) atomic_store_explicit(&UC_GET(p)->field, (value), memory_order_relaxed)
+#define UC_OR(p, field, word, value) ((void)atomic_fetch_or_explicit(&UC_GET(p)->field[(word)], (value), memory_order_relaxed))
+#define UC_LOAD(s, field) atomic_load_explicit(&(s)->field, memory_order_relaxed)
+/* All collection hooks below perform integer/atomic operations only. The
+ * diagnostic caller dumps after every peer owner has stopped and joined. */
+void ob_mapping_udp_counters_dump(void)
+{
+    int saved_errno = errno;
+    for (unsigned int role = 0; role < 2U; ++role) {
+        struct ob_udp_counters *s = &ob_udp_counters[role];
+        fprintf(stderr, "udp counters role=%u bss=%zu enq_ok=%llu enq_denied=%llu send_flow=%llu send_packet=%llu target_reads=%llu target_n=%llu send_attempts=%llu admitted=%llu eagain=%llu negative=%llu mss_drop=%llu last_rc=%lld sent_bits=%016llx/%016llx ttl_expired=%llu ttl_offset=%llu recv_flow=%llu recv_packet=%llu recv_fragments=%llu recv_bytes=%llu recv_bits=%016llx/%016llx incomplete_drops=%llu drop_received=%llu drop_bits=%016llx/%016llx deliveries=%llu delivery_n=%lld delivery_errno=%llu lost_count=%llu\n",
+            role, sizeof(ob_udp_counters),
+            (unsigned long long)UC_LOAD(s, enq_ok), (unsigned long long)UC_LOAD(s, enq_denied),
+            (unsigned long long)UC_LOAD(s, send_flow), (unsigned long long)UC_LOAD(s, send_packet),
+            (unsigned long long)UC_LOAD(s, target_reads), (unsigned long long)UC_LOAD(s, target_n),
+            (unsigned long long)UC_LOAD(s, send_attempts), (unsigned long long)UC_LOAD(s, admitted),
+            (unsigned long long)UC_LOAD(s, eagain), (unsigned long long)UC_LOAD(s, negative),
+            (unsigned long long)UC_LOAD(s, mss_drop), (long long)UC_LOAD(s, last_rc),
+            (unsigned long long)UC_LOAD(s, sent_bits[0]), (unsigned long long)UC_LOAD(s, sent_bits[1]),
+            (unsigned long long)UC_LOAD(s, ttl_expired), (unsigned long long)UC_LOAD(s, ttl_offset),
+            (unsigned long long)UC_LOAD(s, recv_flow), (unsigned long long)UC_LOAD(s, recv_packet),
+            (unsigned long long)UC_LOAD(s, recv_fragments), (unsigned long long)UC_LOAD(s, recv_bytes),
+            (unsigned long long)UC_LOAD(s, recv_bits[0]), (unsigned long long)UC_LOAD(s, recv_bits[1]),
+            (unsigned long long)UC_LOAD(s, incomplete_drops), (unsigned long long)UC_LOAD(s, drop_received),
+            (unsigned long long)UC_LOAD(s, drop_bits[0]), (unsigned long long)UC_LOAD(s, drop_bits[1]),
+            (unsigned long long)UC_LOAD(s, deliveries), (long long)UC_LOAD(s, delivery_n),
+            (unsigned long long)UC_LOAD(s, delivery_errno), (unsigned long long)UC_LOAD(s, lost_count));
+        for (unsigned int fragment = 0; fragment < 128U; ++fragment)
+            if (UC_LOAD(s, sent_bits[fragment / 64U]) & (UINT64_C(1) << (fragment % 64U)))
+                fprintf(stderr, "udp admitted-id role=%u fragment=%u offset=%u dgram=%llu\n", role, fragment, fragment * M_FRAGMENT, (unsigned long long)UC_LOAD(s, sent_ids[fragment]));
+        uint64_t lost = UC_LOAD(s, lost_count);
+        for (unsigned int index = 0; index < 128U && index < lost; ++index)
+            fprintf(stderr, "udp lost-id role=%u index=%u dgram=%llu\n", role, index, (unsigned long long)UC_LOAD(s, lost_ids[index]));
+        fprintf(stderr, "udp lost-overflow role=%u count=%llu\n", role, (unsigned long long)(lost > 128U ? lost - 128U : 0U));
+    }
+    errno = saved_errno;
+}
+#endif
 
 enum m_phase { M_CONTROL, M_RESOLVING, M_CONNECTING, M_REPLY, M_ACTIVE, M_DEAD };
 struct m_resolve {
@@ -686,13 +775,31 @@ static void m_tcp_tick(struct ob_flow *f)
 static void m_udp_enqueue(struct ob_flow *f, const unsigned char *data, size_t len)
 {
     if ((len && !data) || len > M_UDP_MAX || f->udp_count >= M_UDP_QUEUE ||
-        f->next_packet == UINT64_MAX) return;
+        f->next_packet == UINT64_MAX) {
+        if (len == M_UDP_MAX) U_TRACE("udp enqueue-filter role=%d flow=%llu len=%zu queue=%u sequence=%llu\n", f->peer->is_server, (unsigned long long)f->id, len, f->udp_count, (unsigned long long)f->next_packet);
+#ifdef OB_UDP_COUNTERS
+        if (len == M_UDP_MAX) UC_ADD(f->peer, enq_denied, 1U);
+#endif
+        return;
+    }
     struct m_udp_packet *q = m_alloc(f->peer, sizeof(*q) + len);
-    if (!q) return;
+    if (!q) {
+        U_TRACE("udp enqueue-denied role=%d flow=%llu len=%zu queue=%u\n", f->peer->is_server, (unsigned long long)f->id, len, f->udp_count);
+#ifdef OB_UDP_COUNTERS
+        if (len == M_UDP_MAX) UC_ADD(f->peer, enq_denied, 1U);
+#endif
+        return;
+    }
     q->id = ++f->next_packet; q->created = ob_now_us(); q->len = len;
     if (len) memcpy(q->data, data, len);
     if (f->udp_tail) f->udp_tail->next = q; else f->udp_head = q;
     f->udp_tail = q; ++f->udp_count; f->last_io = q->created;
+#ifdef OB_UDP_COUNTERS
+    if (len == M_UDP_MAX) {
+        UC_ADD(f->peer, enq_ok, 1U); UC_SET(f->peer, send_flow, f->id); UC_SET(f->peer, send_packet, q->id);
+    }
+#endif
+    if (len == M_UDP_MAX) U_TRACE("udp enqueue role=%d flow=%llu packet=%llu len=%zu queue=%u time=%llu\n", f->peer->is_server, (unsigned long long)f->id, (unsigned long long)q->id, len, f->udp_count, (unsigned long long)q->created);
 }
 static void m_udp_pop(struct ob_flow *f)
 {
@@ -708,8 +815,17 @@ static void m_udp_flush(struct ob_flow *f, unsigned int *budget)
     unsigned int per_flow = 8;
     while (f->udp_head && *budget && per_flow) {
         struct m_udp_packet *q = f->udp_head;
-        if (m_expired(ob_now_us(), q->created, M_PACKET_TTL_US)) { m_udp_pop(f); continue; }
+        if (m_expired(ob_now_us(), q->created, M_PACKET_TTL_US)) {
+#ifdef OB_UDP_COUNTERS
+            if (q->len == M_UDP_MAX) { UC_ADD(f->peer, ttl_expired, 1U); UC_SET(f->peer, ttl_offset, q->offset); }
+#endif
+            if (q->len == M_UDP_MAX) U_TRACE("udp expire role=%d flow=%llu packet=%llu offset=%zu total=%zu age_us=%llu\n", f->peer->is_server, (unsigned long long)f->id, (unsigned long long)q->id, q->offset, q->len, (unsigned long long)(ob_now_us() - q->created));
+            m_udp_pop(f); continue;
+        }
         if (xqc_datagram_get_mss(f->peer->conn) < M_DHEADER + M_FRAGMENT) {
+#ifdef OB_UDP_COUNTERS
+            if (q->len == M_UDP_MAX) UC_ADD(f->peer, mss_drop, 1U);
+#endif
             m_udp_pop(f); continue;
         }
         unsigned char wire[M_DHEADER + M_FRAGMENT];
@@ -722,6 +838,19 @@ static void m_udp_flush(struct ob_flow *f, unsigned int *budget)
         uint64_t dgram_id = 0;
         int rc = xqc_datagram_send(f->peer->conn, wire, M_DHEADER + len,
                                    &dgram_id, XQC_DATA_QOS_NORMAL);
+#ifdef OB_UDP_COUNTERS
+        if (q->len == M_UDP_MAX) {
+            UC_ADD(f->peer, send_attempts, 1U); UC_SET(f->peer, last_rc, rc);
+            if (rc >= 0) {
+                unsigned int fragment = (unsigned int)(q->offset / M_FRAGMENT);
+                UC_ADD(f->peer, admitted, 1U);
+                UC_OR(f->peer, sent_bits, fragment / 64U, UINT64_C(1) << (fragment % 64U));
+                UC_SET(f->peer, sent_ids[fragment], dgram_id);
+            } else if (rc == -XQC_EAGAIN) UC_ADD(f->peer, eagain, 1U);
+            else UC_ADD(f->peer, negative, 1U);
+        }
+#endif
+        if (q->len == M_UDP_MAX) U_TRACE("udp send role=%d flow=%llu packet=%llu offset=%zu size=%zu age_us=%llu rc=%d dgram=%llu\n", f->peer->is_server, (unsigned long long)f->id, (unsigned long long)q->id, q->offset, len, (unsigned long long)(ob_now_us() - q->created), rc, (unsigned long long)dgram_id);
         if (f->close_requested || !f->stream) return;
         if (rc == -XQC_EAGAIN) return;
         --*budget; --per_flow;
@@ -738,6 +867,9 @@ static void m_udp_target_read(struct ob_flow *f)
     for (unsigned int i = 0; i < 4; ++i) {
         ssize_t n = recv(f->fd, s->udp, sizeof(s->udp), 0);
         if (n < 0) { if (!m_again()) m_abort(f); return; }
+#ifdef OB_UDP_COUNTERS
+        if ((size_t)n == M_UDP_MAX) { UC_ADD(f->peer, target_reads, 1U); UC_SET(f->peer, target_n, (uint64_t)n); }
+#endif
         if ((size_t)n <= M_UDP_MAX) m_udp_enqueue(f, s->udp, (size_t)n);
     }
 }
@@ -827,6 +959,13 @@ static void m_map_tick(ob_remote_map *map, unsigned int *budget)
 }
 static void m_assembly_drop(struct ob_flow *f, struct m_assembly *a)
 {
+#ifdef OB_UDP_COUNTERS
+    if (a->total == M_UDP_MAX && a->received != a->total) {
+        UC_ADD(f->peer, incomplete_drops, 1U); UC_SET(f->peer, drop_received, a->received);
+        UC_SET(f->peer, drop_bits[0], a->bits[0]); UC_SET(f->peer, drop_bits[1], a->bits[1]);
+    }
+#endif
+    if (a->total == M_UDP_MAX) U_TRACE("udp assembly-drop role=%d flow=%llu packet=%llu received=%zu total=%zu bits=%016llx/%016llx gap_us=%llu\n", f->peer->is_server, (unsigned long long)f->id, (unsigned long long)a->id, a->received, a->total, (unsigned long long)a->bits[0], (unsigned long long)a->bits[1], (unsigned long long)(ob_now_us() - a->updated));
     m_free(f->peer, a->data, a->total ? a->total : 1U); memset(a, 0, sizeof(*a));
 }
 static void m_udp_read(xqc_connection_t *conn, void *data_user,
@@ -881,6 +1020,13 @@ static void m_udp_read(xqc_connection_t *conn, void *data_user,
     }
     if (size) memcpy(a->data + offset, v + M_DHEADER, size);
     a->bits[word] |= bit; a->received += size; a->updated = now;
+#ifdef OB_UDP_COUNTERS
+    if (total == M_UDP_MAX) {
+        UC_SET(p, recv_flow, f->id); UC_SET(p, recv_packet, packet); UC_ADD(p, recv_fragments, 1U);
+        UC_ADD(p, recv_bytes, size); UC_OR(p, recv_bits, word, bit);
+    }
+#endif
+    if (total == M_UDP_MAX) U_TRACE("udp recv role=%d flow=%llu packet=%llu offset=%zu size=%zu received=%zu bits=%016llx/%016llx time=%llu\n", p->is_server, (unsigned long long)f->id, (unsigned long long)packet, offset, size, a->received, (unsigned long long)a->bits[0], (unsigned long long)a->bits[1], (unsigned long long)now);
     if (a->received != total) return;
     /* Only a complete packet reaches a real socket, exactly once. Socket
      * EAGAIN and ICMP errors drop UDP; they never cause reliable retransmit. */
@@ -888,6 +1034,12 @@ static void m_udp_read(xqc_connection_t *conn, void *data_user,
     if (f->local) n = sendto(f->map->fd, a->data, total, MSG_NOSIGNAL,
                               (const struct sockaddr *)&f->source, f->source_len);
     else n = send(f->fd, a->data, total, MSG_NOSIGNAL);
+#ifdef OB_UDP_COUNTERS
+    if (total == M_UDP_MAX) {
+        UC_ADD(p, deliveries, 1U); UC_SET(p, delivery_n, n); UC_SET(p, delivery_errno, n < 0 ? errno : 0);
+    }
+#endif
+    if (total == M_UDP_MAX) U_TRACE("udp deliver role=%d flow=%llu packet=%llu total=%zu n=%zd errno=%d time=%llu\n", p->is_server, (unsigned long long)f->id, (unsigned long long)packet, total, n, n < 0 ? errno : 0, (unsigned long long)now);
     if (n >= 0) f->last_io = now;
     else if (!m_again() && !f->local) f->close_requested = 1;
     f->delivered |= UINT64_C(1) << behind;
@@ -978,7 +1130,20 @@ static void m_udp_write(xqc_connection_t *conn, void *data)
 }
 static xqc_int_t m_udp_lost(xqc_connection_t *conn, uint64_t id, void *data)
 {
-    (void)conn; (void)id; (void)data; return 0;
+    (void)conn; (void)id; (void)data;
+#if defined(OB_UDP_TRACE) || defined(OB_UDP_COUNTERS)
+    ob_remote_peer *p = data;
+#endif
+#ifdef OB_UDP_TRACE
+    if (p) U_TRACE("udp lost role=%d dgram=%llu time=%llu\n", p->is_server, (unsigned long long)id, (unsigned long long)ob_now_us());
+#endif
+#ifdef OB_UDP_COUNTERS
+    if (p) {
+        uint64_t index = atomic_fetch_add_explicit(&UC_GET(p)->lost_count, 1U, memory_order_relaxed);
+        if (index < 128U) UC_SET(p, lost_ids[index], id);
+    }
+#endif
+    return 0;
 }
 void ob_mapping_callbacks(xqc_app_proto_callbacks_t *callbacks)
 {

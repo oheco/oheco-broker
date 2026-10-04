@@ -1,6 +1,6 @@
 # Oheco.Broker — pure C# source SDK (.NET 10)
 
-The 0.3.0 package includes this source SDK for **local command execution**, not the remote peer/port-mapping engine. Start the local service explicitly with `oheco-broker shell serve`; no arguments now show CLI help. Reference the project or embed `BrokerProcess.cs` as below; no prebuilt SDK assembly is distributed.
+The 0.4.0 package includes this source SDK for **local command execution**, not the remote peer/port-mapping engine. Start the local service explicitly with `oheco-broker shell serve`; no arguments now show CLI help. Reference the project or embed `BrokerProcess.cs` as below; no prebuilt SDK assembly is distributed.
 
 `BrokerProcess.cs` implements [protocols v1 and v2](../../protocol/PROTOCOL.md) directly with managed sockets. Managed process APIs use v1 and remain compatible with the 0.1.0 broker; detached startup requires v2, available since 0.2.0 and retained by 0.3.0 `shell serve`. No C SDK, P/Invoke, native helper, JSON, extra NuGet package, DNS, or automatic retry is used. The local service must already be running. This is trusted-local-development tooling, not an authenticated or sandboxed execution service.
 

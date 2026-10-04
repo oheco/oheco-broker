@@ -19,6 +19,12 @@
 #include <errno.h>
 #include <time.h>
 #include "peer_policy_test.c"
+#ifdef OB_UDP_TRACE
+extern void ob_mapping_udp_trace_dump(void);
+#endif
+#ifdef OB_UDP_COUNTERS
+extern void ob_mapping_udp_counters_dump(void);
+#endif
 struct echo { int fd, udp; uint16_t port; pthread_t thread; atomic_int stop; atomic_uint udp_received, udp_echoed; atomic_int udp_last_error; };
 static void pause_ms(unsigned n)
 { struct timespec t = {n/1000, (long)(n%1000)*1000000}; while(nanosleep(&t,&t)&&errno==EINTR){} }
@@ -333,5 +339,12 @@ done:
     if(server)ob_remote_server_close(server);
     ob_api_credentials_clear(&credentials);
     echo_stop(&tcp);echo_stop(&udp);ob_api_response_free(response);
-    ob_api_client_destroy(api);ob_api_client_destroy(anonymous);return result;
+    ob_api_client_destroy(api);ob_api_client_destroy(anonymous);
+#ifdef OB_UDP_TRACE
+    ob_mapping_udp_trace_dump();
+#endif
+#ifdef OB_UDP_COUNTERS
+    ob_mapping_udp_counters_dump();
+#endif
+    return result;
 }

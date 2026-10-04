@@ -1,4 +1,4 @@
-# Go source SDK — 0.3.0
+# Go source SDK — 0.4.0
 
 Import `github.com/oheco/oheco-broker/sdk/go/remote` for management, authenticated peers and TCP/UDP mappings. The package wraps the same C engine through cgo; it does not implement another ICE/TURN/QUIC or cryptographic stack. This is source distribution, without a prebuilt Go or C SDK library.
 
@@ -26,6 +26,6 @@ The SDK does not automatically register/persist account credentials or start a m
 
 ## Connection recovery
 
-`Client.ConnectAsync` returns a persistent peer before initial network setup completes. Both `Peer` and `Server` provide `SetReconnectPolicy`, `GetConnectionInfo` and nonblocking `Reconnect`; a nil error from `Reconnect` means accepted, and callers observe completion through the copied connection snapshot. Existing `Connect` still waits for the initial authenticated connection. Zero `ReconnectPolicy` fields select the C manager's defaults, including eight attempts, exponential delays starting at one second, a 60-second retry budget, a 120-second TCP grace and 15-second v2 transport detection. `Disabled` pauses automatic retries while preserving manual requests.
+`Client.ConnectAsync` returns a persistent peer before initial network setup completes. Both `Peer` and `Server` provide `SetReconnectPolicy`, `GetConnectionInfo` and nonblocking `Reconnect`; a nil error from `Reconnect` means accepted, and callers observe completion through the copied connection snapshot. Existing `Connect` still waits for the initial authenticated connection. Zero `ReconnectPolicy` fields select the C manager's defaults, including eight attempts, an immediate first retry followed by exponential delays starting at one second, a 60-second retry budget, a 120-second TCP grace and 15-second v2 transport detection. `Disabled` pauses automatic retries while preserving manual requests.
 
 The native manager keeps mapping handles and local ports through recoverable failures. Existing TCP continuity requires both SDK processes and the target socket to remain alive within the grace period; context loss closes the old TCP flow rather than replaying it into a newly opened target socket. Explicit revocation is terminal. Poll `GetConnectionInfo` with an application context/ticker; the wrapper does not pass Go callbacks into C workers. The [recovery guide](../../docs/RECONNECT.md) covers C/Go usage, CLI SIGUSR1, authenticated v2 negotiation, backend compatibility and credential lifetime.

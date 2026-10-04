@@ -126,7 +126,9 @@ static void server_retry_delay(ob_remote_server *s, const ob_api_error *error,
     uint64_t delay = r->info.attempts ? r->policy.initial_delay_ms : 0;
     for (uint32_t i = 1; i < r->info.attempts && delay < r->policy.max_delay_ms; ++i) delay *= 2;
     if (delay > r->policy.max_delay_ms) delay = r->policy.max_delay_ms;
-    r->retry_us = *reconnect = ob_now_us() + (uint64_t)jitter((unsigned)delay)*1000;
+    delay = jitter((unsigned)delay);
+    if (delay > r->policy.max_delay_ms) delay = r->policy.max_delay_ms;
+    r->retry_us = *reconnect = ob_now_us() + delay*1000;
     ob_remote_error remote; ob_error(&remote, OB_REMOTE_EHTTP,
                                     error ? (int)error->http_status : 0,
                                     error ? error->message : "Broker control transport disconnected");

@@ -95,7 +95,7 @@ Linux 和 HarmonyOS 上，对正在运行的 serve/connect 进程发送 `SIGUSR1
 kill -USR1 <serve-or-connect-pid>
 ```
 
-此请求不关闭映射、不更换端口。启用状态事件后，`reconnect_requested` 的 `accepted: true` 表示请求已接受；`connection_state` 记录状态、尝试次数、代数、下次重试延迟和脱敏错误原因。事件采用轮询，可能合并短暂状态变化。事件不包含密码、账户 token、设备 token 或会话 token。`SIGINT`、`SIGTERM` 继续正常关闭程序。
+此请求不关闭映射、不更换端口。启用状态事件后，`reconnect_requested` 的 `accepted: true` 表示请求已接受；`connection_state` 记录状态、尝试次数、代数、下次重试延迟和脱敏错误原因。其中 `generation` 是 SDK 本地的传输尝试序号，未完成认证的尝试也可能递增；它与后端 managed connection 已提交的会话 generation 分别记录。事件采用轮询，可能合并短暂状态变化。事件不包含密码、账户 token、设备 token 或会话 token。`SIGINT`、`SIGTERM` 继续正常关闭程序。
 
 ## TCP 连续性的边界与兼容性
 

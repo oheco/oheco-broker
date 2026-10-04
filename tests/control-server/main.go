@@ -24,6 +24,7 @@ func main() {
 	ready := flag.String("ready", "", "Write endpoint information JSON here")
 	listen := flag.String("listen", "127.0.0.1:0", "Local HTTP fixture address")
 	turnListen := flag.String("turn-listen", "127.0.0.1:0", "Local TURN fixture address")
+	turnSocketBuffer := flag.Int("turn-socket-buffer", 0, "Local TURN socket buffer bytes; zero selects the production default")
 	lease := flag.Duration("broker-lease", 15*time.Second, "Local broker lease for failure injection")
 	flag.Parse()
 	token := os.Getenv("OB_PEER_TEST_ADMIN_TOKEN")
@@ -32,7 +33,7 @@ func main() {
 		os.Exit(2)
 	}
 	gate := newGate(nil, token)
-	service, err := control.New(control.Config{DBPath: *db, AdminToken: token, RegistrationPolicy: "open", BrokerLease: *lease, SessionTTL: time.Minute, BeforeWebSocketRequest: gate.beforeWS, TURN: control.TURNConfig{Enabled: true, ListenAddr: *turnListen, PublicIP: "127.0.0.1", AllowLoopbackPeers: true}})
+	service, err := control.New(control.Config{DBPath: *db, AdminToken: token, RegistrationPolicy: "open", BrokerLease: *lease, SessionTTL: time.Minute, BeforeWebSocketRequest: gate.beforeWS, TURN: control.TURNConfig{Enabled: true, ListenAddr: *turnListen, PublicIP: "127.0.0.1", AllowLoopbackPeers: true, SocketBufferBytes: *turnSocketBuffer}})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

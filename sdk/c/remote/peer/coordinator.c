@@ -196,7 +196,9 @@ static void delay_next(ob_remote_peer *p)
     for (uint32_t i = 1; i < r->info.attempts && delay < r->policy.max_delay_ms; ++i) delay *= 2;
     if (delay > r->policy.max_delay_ms) delay = r->policy.max_delay_ms;
     unsigned jitter = 0; if (RAND_bytes((unsigned char *)&jitter, sizeof(jitter)) != 1) jitter = (unsigned)ob_now_us();
-    r->retry_us = ob_now_us() + (delay + jitter % (delay / 4 + 1)) * 1000;
+    delay += jitter % (delay / 4 + 1);
+    if (delay > r->policy.max_delay_ms) delay = r->policy.max_delay_ms;
+    r->retry_us = ob_now_us() + delay * 1000;
     pthread_mutex_unlock(&p->mu);
 }
 static int server_session(ob_remote_peer *p)

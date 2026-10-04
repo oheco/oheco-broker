@@ -110,12 +110,20 @@ func TestAsyncRecoveryPreservesHandleAndListener(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
+	var initialGeneration uint64
 	wait("PAUSED snapshot", func() bool {
 		info, e := peer.GetConnectionInfo()
 		if e != nil {
 			t.Fatal(e)
 		}
-		return info.State == StatePaused
+		if info.State != StatePaused {
+			return false
+		}
+		if info.NextRetry != 0 {
+			t.Fatalf("paused peer advertised an automatic retry: %+v", info)
+		}
+		initialGeneration = info.Generation
+		return true
 	})
 	if err = peer.Status(); err != nil {
 		t.Fatalf("paused peer became terminal: %v", err)
@@ -125,6 +133,38 @@ func TestAsyncRecoveryPreservesHandleAndListener(t *testing.T) {
 		t.Fatal(err)
 	}
 	wait("manual HTTP attempt with automatic retries disabled", func() bool { return requests.Load() > before })
+	wait("manual PAUSED snapshot", func() bool {
+		info, e := peer.GetConnectionInfo()
+		if e != nil {
+			t.Fatal(e)
+		}
+		if info.State != StatePaused || info.Generation <= initialGeneration {
+			return false
+		}
+		if info.NextRetry != 0 {
+			t.Fatalf("disabled manual attempt advertised an automatic retry: %+v", info)
+		}
+		return true
+	})
+	if err = peer.SetReconnectPolicy(ReconnectPolicy{MaxAttempts: 2, InitialDelay: time.Second, MaxDelay: time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	if err = peer.Reconnect(); err != nil {
+		t.Fatal(err)
+	}
+	wait("automatic RETRY_WAIT snapshot", func() bool {
+		info, e := peer.GetConnectionInfo()
+		if e != nil {
+			t.Fatal(e)
+		}
+		if info.State != StateRetryWait {
+			return false
+		}
+		if info.NextRetry <= 0 || info.NextRetry > time.Second {
+			t.Fatalf("waiting peer did not advertise its bounded retry: %+v", info)
+		}
+		return true
+	})
 	if mapping.Port() != port {
 		t.Fatal("manual retry replaced local listening port")
 	}

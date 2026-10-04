@@ -44,7 +44,8 @@ static ob_remote_connection_info snapshot(struct ob_recovery *r)
 {
     ob_remote_connection_info info = r->info;
     uint64_t now = ob_now_us();
-    info.next_retry_ms = r->retry_us > now ? (r->retry_us - now + 999) / 1000 : 0;
+    info.next_retry_ms = info.state == OB_REMOTE_STATE_RETRY_WAIT && r->retry_us > now
+                             ? (r->retry_us - now + 999) / 1000 : 0;
     return info;
 }
 void ob_recovery_deliver(struct ob_recovery *r, pthread_mutex_t *mu)

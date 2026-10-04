@@ -105,7 +105,9 @@ func normalizeTURNConfig(cfg TURNConfig) (TURNConfig, error) {
 		{&cfg.MaxAllocations, 512}, {&cfg.MaxAllocationsPerTenant, 64},
 		{&cfg.MaxCredentials, 4096}, {&cfg.MaxCredentialsPerTenant, 256},
 		{&cfg.MaxPeersPerAllocation, 32}, {&cfg.MaxChannelsPerAllocation, 64},
-		{&cfg.SocketBufferBytes, 64 * 1024},
+		// A maximum UDP message needs 128 QUIC DATAGRAM fragments. Allow
+		// receive-queue headroom for that burst, framing and kernel overhead.
+		{&cfg.SocketBufferBytes, 256 * 1024},
 	}
 	for _, d := range defaults {
 		if *d.p < 0 {

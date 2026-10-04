@@ -199,6 +199,41 @@ end:
     EVP_PKEY_free(key); EVP_PKEY_CTX_free(ctx); X509_free(cert);
     return rc;
 }
+int ob_resume_key_derive(ob_remote_peer *p)
+{
+    if (!p->control_managed || !ob_valid_id(p->connection_id)) return 0;
+    static const unsigned char info[] = "ob-peer-v2 logical recovery context";
+    if (!HKDF(p->fresh_resume_key, sizeof(p->fresh_resume_key), EVP_sha256(),
+              p->shared, p->shared_len, (const unsigned char *)p->connection_id,
+              strlen(p->connection_id), info, sizeof(info) - 1)) return -1;
+    if (!p->resume_key_set) {
+        memcpy(p->resume_key, p->fresh_resume_key, sizeof(p->resume_key));
+        p->resume_key_set = 1;
+    }
+    return 0;
+}
+int ob_resume_proof(ob_remote_peer *p, int sender_server, unsigned char out[32])
+{
+    if (!p->resume_key_set || !p->session_id || !out ||
+        (sender_server != 0 && sender_server != 1)) return -1;
+    static const unsigned char label[] = "ob-peer-v2 authenticated reattachment";
+    unsigned char generation[8], fresh[32], role = (unsigned char)sender_server;
+    uint64_t n = p->control_generation;
+    for (int i = 7; i >= 0; --i) { generation[i] = (unsigned char)n; n >>= 8; }
+    SHA256(p->shared, p->shared_len, fresh);
+    HMAC_CTX ctx; HMAC_CTX_init(&ctx); unsigned int length = 0;
+    int ok = HMAC_Init_ex(&ctx, p->resume_key, sizeof(p->resume_key), EVP_sha256(), NULL)
+        && HMAC_Update(&ctx, label, sizeof(label))
+        && HMAC_Update(&ctx, &role, 1)
+        && HMAC_Update(&ctx, (const unsigned char *)p->broker_id, strlen(p->broker_id) + 1)
+        && HMAC_Update(&ctx, (const unsigned char *)p->connection_id, strlen(p->connection_id) + 1)
+        && HMAC_Update(&ctx, (const unsigned char *)p->session_id, strlen(p->session_id) + 1)
+        && HMAC_Update(&ctx, generation, sizeof(generation))
+        && HMAC_Update(&ctx, fresh, sizeof(fresh))
+        && HMAC_Final(&ctx, out, &length);
+    HMAC_CTX_cleanup(&ctx); OPENSSL_cleanse(fresh, sizeof(fresh));
+    return ok && length == 32 ? 0 : -1;
+}
 void ob_certificate_cleanup(ob_remote_peer *p)
 {
     if (p->key_path[0]) unlink(p->key_path);

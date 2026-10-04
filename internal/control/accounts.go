@@ -12,6 +12,9 @@ import (
 )
 
 func (s *Server) routes() {
+	s.mux.HandleFunc("GET /v1/status", s.endpoint(s.connectionDiscovery))
+	s.mux.HandleFunc("POST /v1/connections/{id}/session", s.endpoint(s.connectionSession))
+	s.mux.HandleFunc("DELETE /v1/connections/{id}", s.endpoint(s.deleteConnection))
 	s.mux.HandleFunc("GET /v1/ws/brokers/{id}", s.endpoint(s.websocketBroker))
 	s.mux.HandleFunc("GET /v1/ws/sessions/{id}", s.endpoint(s.websocketSession))
 	s.mux.HandleFunc("POST /v1/tenants/register", s.endpoint(s.register))
@@ -190,9 +193,29 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) error {
 	if token == "" {
 		return fail(401, "bearer required")
 	}
-	if _, e := s.db.Exec("DELETE FROM tokens WHERE hash=? AND kind='account'", tokenHash(token)); e != nil {
+	tx, e := s.db.Begin()
+	if e != nil {
 		return e
 	}
+	defer tx.Rollback()
+	hash := tokenHash(token)
+	if e = revokeConnections(tx, "account_hash=?", "account_logout", hash); e != nil {
+		return e
+	}
+	ids := "SELECT session_id FROM connection_sessions WHERE connection_id IN (SELECT id FROM connections WHERE account_hash=?)"
+	if _, e = tx.Exec("DELETE FROM tokens WHERE kind='session' AND session_id IN ("+ids+")", hash); e != nil {
+		return e
+	}
+	if _, e = tx.Exec("DELETE FROM sessions WHERE id IN ("+ids+")", hash); e != nil {
+		return e
+	}
+	if _, e = tx.Exec("DELETE FROM tokens WHERE hash=? AND kind='account'", hash); e != nil {
+		return e
+	}
+	if e = tx.Commit(); e != nil {
+		return e
+	}
+	s.ws.wake(func(*wsPeer) bool { return true })
 	s.write(w, 200, map[string]any{"logged_out": true})
 	return nil
 }
@@ -217,7 +240,7 @@ func (s *Server) capabilities(w http.ResponseWriter, r *http.Request) error {
 	if e != nil {
 		return e
 	}
-	s.write(w, 200, map[string]any{"status": t.Status, "relay_enabled": t.RelayEnabled, "turn_available": s.turn != nil, "stun_address": s.AdvertisedTURNAddr(), "turn_address": s.AdvertisedTURNAddr(), "turn_credential_renewal": s.turnRenewalMode(), "signaling": wsProtocol, "session_ttl_seconds": int(s.cfg.SessionTTL.Seconds()), "broker_lease_seconds": int(s.cfg.BrokerLease.Seconds()), "max_message_bytes": s.cfg.MaxMessageBytes, "max_messages_per_direction": s.cfg.MaxMessagesPerDirection, "tenant_daily_byte_quota": s.cfg.TenantDailyByteQuota})
+	s.write(w, 200, map[string]any{"status": t.Status, "relay_enabled": t.RelayEnabled, "turn_available": s.turn != nil, "stun_address": s.AdvertisedTURNAddr(), "turn_address": s.AdvertisedTURNAddr(), "turn_credential_renewal": s.turnRenewalMode(), "signaling": wsProtocol, "connection_recovery_version": 1, "session_ttl_seconds": int(s.cfg.SessionTTL.Seconds()), "broker_lease_seconds": int(s.cfg.BrokerLease.Seconds()), "max_message_bytes": s.cfg.MaxMessageBytes, "max_messages_per_direction": s.cfg.MaxMessagesPerDirection, "tenant_daily_byte_quota": s.cfg.TenantDailyByteQuota})
 	return nil
 }
 func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) error {
@@ -324,6 +347,9 @@ func (s *Server) updateAccount(t Tenant, hash *string, replacement bool, expecte
 		if _, e = tx.Exec("UPDATE tenants SET password_hash=? WHERE id=?", *hash, t.ID); e != nil {
 			return "", e
 		}
+	}
+	if e = revokeConnections(tx, "tenant_id=?", "tenant_reset", t.ID); e != nil {
+		return "", e
 	}
 	if _, e = tx.Exec("DELETE FROM tokens WHERE tenant_id=?", t.ID); e != nil {
 		return "", e
@@ -578,7 +604,15 @@ func (s *Server) updateCapabilities(t Tenant, setStatus, setRelay bool, expected
 	if _, e = tx.Exec("UPDATE tenants SET status=?,relay_enabled=?,updated_at=? WHERE id=?", t.Status, boolInt(t.RelayEnabled), now(), t.ID); e != nil {
 		return e
 	}
+	if t.Status != "active" {
+		if e = revokeConnections(tx, "tenant_id=?", "tenant_disabled", t.ID); e != nil {
+			return e
+		}
+	}
 	if !t.RelayEnabled {
+		if e = revokeConnections(tx, "tenant_id=? AND relay_mode='force'", "relay_revoked", t.ID); e != nil {
+			return e
+		}
 		if _, e = tx.Exec("DELETE FROM tokens WHERE kind='session' AND session_id IN (SELECT id FROM sessions WHERE tenant_id=? AND relay_mode='force')", t.ID); e != nil {
 			return e
 		}
@@ -674,7 +708,7 @@ func (s *Server) adminInfo(w http.ResponseWriter, r *http.Request) error {
 		}
 		counts[table] = n
 	}
-	s.write(w, 200, map[string]any{"schema_version": 1, "listen_addr": s.cfg.ListenAddr, "turn_addr": s.TURNAddr(), "counts": counts, "signaling": wsProtocol, "storage": "sqlite3", "quic_termination": false})
+	s.write(w, 200, map[string]any{"schema_version": 2, "listen_addr": s.cfg.ListenAddr, "turn_addr": s.TURNAddr(), "counts": counts, "signaling": wsProtocol, "storage": "sqlite3", "quic_termination": false})
 	return nil
 }
 func (s *Server) myUsage(w http.ResponseWriter, r *http.Request) error {

@@ -216,8 +216,17 @@ static size_t header_write(char *ptr, size_t size, size_t count, void *arg) {
     b->headers += n; return n;
 }
 
-int ob_api_request(ob_api_client *c, const char *method, const char *path,
-                   const char *bearer, const char *body, char **out, ob_api_error *e) {
+struct request_cancel { ob_api_cancel_callback callback; void *user; };
+static int request_progress(void *arg, curl_off_t download_total, curl_off_t downloaded,
+                             curl_off_t upload_total, curl_off_t uploaded) {
+    (void)download_total; (void)downloaded; (void)upload_total; (void)uploaded;
+    struct request_cancel *cancel = arg;
+    return cancel->callback ? cancel->callback(cancel->user) : 0;
+}
+int ob_api_request_cancelled(ob_api_client *c, const char *method, const char *path,
+                    const char *bearer, const char *body, char **out, ob_api_error *e,
+                    ob_api_cancel_callback callback, void *user) {
+    struct request_cancel cancel = {callback, user};
     reset(e, out);
     if (!c || !out || !method || (strcmp(method,"GET") && strcmp(method,"POST") &&
         strcmp(method,"PATCH") && strcmp(method,"DELETE")) || !path_valid(path) ||
@@ -243,7 +252,7 @@ int ob_api_request(ob_api_client *c, const char *method, const char *path,
     if (!url) goto nomem;
     sprintf(url, "%s%s", c->base_url, path);
 #define ADD_HEADER(value) do { struct curl_slist *tmp = curl_slist_append(headers, (value)); \
-    if (!tmp) goto nomem; headers = tmp; } while (0)
+    if (!tmp) { goto nomem; } headers = tmp; } while (0)
     ADD_HEADER("Accept: application/json");
     ADD_HEADER("Content-Type: application/json");
     ADD_HEADER("Expect:");
@@ -262,6 +271,11 @@ int ob_api_request(ob_api_client *c, const char *method, const char *path,
     SETOPT(CURLOPT_CUSTOMREQUEST, method);
     SETOPT(CURLOPT_HTTPHEADER, headers);
     SETOPT(CURLOPT_NOSIGNAL, 1L);
+    if (callback) {
+        SETOPT(CURLOPT_NOPROGRESS, 0L);
+        SETOPT(CURLOPT_XFERINFOFUNCTION, request_progress);
+        SETOPT(CURLOPT_XFERINFODATA, &cancel);
+    }
     SETOPT(CURLOPT_TIMEOUT_MS, c->timeout_ms);
     SETOPT(CURLOPT_CONNECTTIMEOUT_MS, c->timeout_ms < 5000 ? c->timeout_ms : 5000L);
     SETOPT(CURLOPT_LOW_SPEED_LIMIT, 1L);
@@ -321,6 +335,10 @@ done:
 #undef ADD_HEADER
 }
 
+int ob_api_request(ob_api_client *c, const char *method, const char *path,
+                    const char *bearer, const char *body, char **out, ob_api_error *e) {
+    return ob_api_request_cancelled(c, method, path, bearer, body, out, e, NULL, NULL);
+}
 static int bad_args(char **out, ob_api_error *e) {
     reset(e, out); return fail(e, OB_API_INVALID, "Invalid typed request arguments");
 }

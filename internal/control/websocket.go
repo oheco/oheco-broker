@@ -163,6 +163,7 @@ type wsPeer struct {
 	hash         string
 	identity     principal
 	target, side string
+	connectionID string
 	brokerWatch  bool
 	connMu       sync.Mutex
 	conn         *websocket.Conn
@@ -214,6 +215,11 @@ func (p *wsPeer) request(body []byte) *http.Request {
 	return r
 }
 func (p *wsPeer) validate() error {
+	if !p.brokerWatch && p.connectionID != "" {
+		if err := p.s.connectionSessionState(p.connectionID, p.target, p.identity); err != nil {
+			return err
+		}
+	}
 	r := p.request(nil)
 	var identity principal
 	var side string
@@ -238,12 +244,12 @@ func (p *wsPeer) validate() error {
 	return nil
 }
 
-func wsError(err error) (int, map[string]string) {
+func wsError(err error) (int, map[string]any) {
 	var a *apiError
 	if errors.As(err, &a) {
-		return a.code, map[string]string{"error": a.message}
+		return a.code, apiErrorBody(a)
 	}
-	return 500, map[string]string{"error": "internal server error"}
+	return 500, map[string]any{"error": "internal server error"}
 }
 func (p *wsPeer) enqueue(v any, sequence int64, terminal bool, code int) bool {
 	select {
@@ -375,7 +381,9 @@ func (s *Server) websocketConnect(w http.ResponseWriter, r *http.Request, broker
 	if brokerWatch {
 		p.identity, _, err = s.deviceBroker(r, false)
 	} else {
-		p.identity, _, p.side, err = s.sessionPrincipal(r)
+		var v Session
+		p.identity, v, p.side, err = s.sessionPrincipal(r)
+		p.connectionID = v.ConnectionID
 	}
 	if err != nil {
 		return err
@@ -671,7 +679,7 @@ func (p *wsPeer) rpc(in wsInput) (int, any) {
 	}
 	w := &wsCaptureWriter{header: make(http.Header)}
 	if err := handler(w, p.request(in.body)); err != nil {
-		return wsError(err)
+		return wsError(p.s.persistObservedRevocation(err))
 	}
 	if !json.Valid(w.body.Bytes()) {
 		return 500, map[string]string{"error": "invalid internal result"}
@@ -688,7 +696,7 @@ func (p *wsPeer) catchup(initial bool) error {
 	if p.brokerWatch {
 		kind = "sessions"
 		// Materialize rows fully before any nested query: SQLite has one owner.
-		rows, err := p.s.db.Query("SELECT id,tenant_id,broker_id,relay_mode,peer_authenticated,relay_approved,expires_at FROM sessions WHERE broker_id=? AND expires_at>? ORDER BY expires_at,id LIMIT 129", p.target, now())
+		rows, err := p.s.db.Query("SELECT s.id,s.tenant_id,s.broker_id,s.relay_mode,s.peer_authenticated,s.relay_approved,s.expires_at,COALESCE(c.connection_id,''),COALESCE(c.generation,0) FROM sessions s LEFT JOIN connection_sessions c ON c.session_id=s.id WHERE s.broker_id=? AND s.expires_at>? ORDER BY s.expires_at,s.id LIMIT 129", p.target, now())
 		if err != nil {
 			return err
 		}
@@ -697,7 +705,7 @@ func (p *wsPeer) catchup(initial bool) error {
 			var v Session
 			var peer, relay int
 			var expiry int64
-			if err = rows.Scan(&v.ID, &v.TenantID, &v.BrokerID, &v.RelayMode, &peer, &relay, &expiry); err != nil {
+			if err = rows.Scan(&v.ID, &v.TenantID, &v.BrokerID, &v.RelayMode, &peer, &relay, &expiry, &v.ConnectionID, &v.Generation); err != nil {
 				_ = rows.Close()
 				return err
 			}

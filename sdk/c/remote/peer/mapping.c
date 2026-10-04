@@ -33,6 +33,13 @@
 #define M_PROOF 1U
 #define M_OPEN 2U
 #define M_ACK 3U
+#define M_RESUME 4U
+#define M_RESUME_ACK 5U
+#define M_RESUME_SIZE 40U
+#define M_V2_HEADER 24U
+#define M_V2_DATA 1U
+#define M_V2_ACK 2U
+#define M_V2_FIN 3U
 #define M_DHEADER 28U
 #define M_FRAGMENT 512U
 #define M_UDP_MAX 65507U
@@ -85,9 +92,21 @@ struct ob_flow {
     size_t control_len, control_need, reply_len, reply_pos;
 #ifdef OB_MAPPING_TRACE
     unsigned int trace_send, trace_read;
+    uint64_t trace_tick_us;
+    ssize_t trace_last_send, trace_last_recv;
 #endif
     unsigned char *tx, *rx;
     size_t tx_len, tx_pos, rx_len, rx_pos;
+    /* V2 retains tx until cumulative delivery to the other real socket.
+     * stream_generation is an attachment, never the logical flow identity. */
+    uint64_t stream_generation, grace_deadline_us, tx_base, tx_sent_high, rx_commit, rx_next;
+    uint64_t tx_final, rx_final;
+    int wire_version, transient, suspended, pending_open, waiting_resume, resuming;
+    int rx_fin, rx_fin_applied, tx_fin_acked, ack_dirty;
+    unsigned char in_frame[M_V2_HEADER], out_frame[M_V2_HEADER];
+    size_t in_have, in_size, in_pos, out_pos;
+    uint64_t in_offset, out_offset, out_end;
+    unsigned int in_kind, in_flags, out_kind, out_flags;
     struct m_udp_packet *udp_head, *udp_tail;
     unsigned int udp_count;
     struct m_assembly assembly[M_REASSEMBLY];
@@ -106,6 +125,11 @@ struct m_state {
 };
 
 static void m_stop_io(ob_remote_peer *p);
+static int m_v2_control_done(struct ob_flow *f);
+static void m_v2_read(struct ob_flow *f);
+static void m_v2_write(struct ob_flow *f);
+static void m_v2_tick(struct ob_flow *f);
+static int m_resume_open(struct ob_flow *f);
 
 /* A tick's timestamp can precede flows/packets created later in that same
  * tick, including timestamps written by synchronous xquic callbacks. Never
@@ -132,13 +156,25 @@ static struct m_state *m_state_get(ob_remote_peer *p)
     }
     return p->mapping_private;
 }
-static void *m_alloc(ob_remote_peer *p, size_t n)
+static void *m_control_alloc(ob_remote_peer *p, size_t n)
 {
     struct m_state *s = m_state_get(p);
     if (!s || n > M_MEMORY || s->memory > M_MEMORY - n) return NULL;
     void *v = calloc(1, n);
     if (v) s->memory += n;
     return v;
+}
+static void *m_alloc(ob_remote_peer *p, size_t n)
+{
+    struct m_state *s = m_state_get(p);
+    /* Retained payload must leave room for every admitted flow's incoming
+     * RESUME parser and channel proof, even when xquic receives a whole batch
+     * before the regular tick can rebind and free placeholders. The reserve is
+     * inside the same hard budget, not an additional allocation allowance. */
+    size_t reserve = ((size_t)m_limit(p->max_flows, 128U, M_FLOWS) + 2U) * sizeof(struct ob_flow);
+    size_t limit = M_MEMORY - reserve;
+    if (!s || n > limit || s->memory > limit - n) return NULL;
+    return m_control_alloc(p, n);
 }
 static void m_free(ob_remote_peer *p, void *v, size_t n)
 {
@@ -295,11 +331,13 @@ static void m_release_io(struct ob_flow *f)
     m_free(f->peer, f->rx, OB_STREAM_BUFFER); f->rx = NULL;
     m_drop_udp(f);
 }
-static void m_abort_at(struct ob_flow *f, int line)
+static void m_abort_at(struct ob_flow *f, const char *file, int line)
 {
-    (void)line;
-    M_TRACE("mapping abort role=%d flow=%llu phase=%d line=%d ack=%d\n",
-            f->peer->is_server, (unsigned long long)f->id, f->phase, line, f->acked);
+    (void)file; (void)line;
+    M_TRACE("mapping abort role=%d gen=%llu flow=%llu fd=%d phase=%d location=%s:%d ack=%d suspended=%d resuming=%d\n",
+            f->peer->is_server, (unsigned long long)f->peer->transport_generation,
+            (unsigned long long)f->id, f->fd, f->phase, file, line, f->acked,
+            f->suspended, f->resuming);
     f->phase = M_DEAD;
     m_release_io(f);
     if (f->stream && !f->close_sent) {
@@ -307,15 +345,19 @@ static void m_abort_at(struct ob_flow *f, int line)
         (void)xqc_stream_close(f->stream);
     }
 }
-#define m_abort(f) m_abort_at((f), __LINE__)
+#define m_abort(f) m_abort_at((f), __FILE__, __LINE__)
 static void m_fail(ob_remote_peer *p, int code, const char *message)
 {
-    ob_peer_fail_locked(p, code, message);
+    if (code == OB_REMOTE_EQUIC || code == OB_REMOTE_EICE || code == OB_REMOTE_ETIMEOUT)
+        ob_peer_transport_fail_locked(p, code, message);
+    else ob_peer_fail_locked(p, code, message);
 }
 static struct ob_flow *m_flow_new(ob_remote_peer *p)
 {
-    if (p->flow_count >= m_limit(p->max_flows, 128U, M_FLOWS) + 1U) return NULL;
-    struct ob_flow *f = m_alloc(p, sizeof(*f));
+    /* Incoming RESUME headers temporarily coexist with the retained logical
+     * flow. Both allocations count against M_MEMORY, with a separate hard cap. */
+    if (p->flow_count >= 2U * m_limit(p->max_flows, 128U, M_FLOWS) + 2U) return NULL;
+    struct ob_flow *f = m_control_alloc(p, sizeof(*f));
     if (!f) return NULL;
     f->peer = p; f->fd = -1; f->phase = M_CONTROL;
     f->created = f->last_io = ob_now_us(); f->control_need = M_HEADER;
@@ -334,13 +376,13 @@ static size_t m_data_flow_count(ob_remote_peer *p)
 {
     size_t count = 0;
     for (struct ob_flow *f = p->flows; f; f = f->next)
-        if (!f->proof) ++count;
+        if (!f->proof && !f->transient && f->phase != M_DEAD) ++count;
     return count;
 }
 static struct ob_flow *m_find(ob_remote_peer *p, uint64_t id)
 {
     for (struct ob_flow *f = p->flows; f; f = f->next)
-        if (!f->proof && f->id == id) return f;
+        if (!f->proof && !f->transient && f->phase != M_DEAD && f->id == id) return f;
     return NULL;
 }
 static int m_tcp_buffers(struct ob_flow *f)
@@ -352,7 +394,9 @@ static int m_tcp_buffers(struct ob_flow *f)
 }
 static int m_stream_open(struct ob_flow *f)
 {
-    if (!f->peer->conn || atomic_load(&f->peer->stop)) return -1;
+    if (!f->peer->conn || atomic_load(&f->peer->stop)
+        || atomic_load(&f->peer->attempt_stop)) return -1;
+    f->stream_generation = f->peer->transport_generation;
     f->stream = xqc_stream_create_with_direction(f->peer->conn,
                                                  XQC_STREAM_BIDI, f);
     return f->stream ? 0 : -1;
@@ -382,7 +426,13 @@ static void m_reply_flush(struct ob_flow *f)
                     f->reply[4], f->phase, f->reply_pos, f->reply_len, n);
 #endif
         if (n == -XQC_EAGAIN) return;
-        if (n < 0) { M_TRACE("mapping reply-send error=%zd\n", n); m_abort(f); return; }
+        if (n < 0) {
+            M_TRACE("mapping reply-send error=%zd\n", n);
+            if (f->wire_version == 2 && f->protocol == OB_REMOTE_TCP)
+                ob_peer_transport_fail_locked(f->peer, OB_REMOTE_EQUIC, "TCP control send failed");
+            else m_abort(f);
+            return;
+        }
         if (!f->stream || f->close_requested) return;
         f->reply_pos += (size_t)n;
         if (f->reply_pos < f->reply_len) return;
@@ -411,15 +461,26 @@ static int m_header_check(struct ob_flow *f)
     if (f->proof) {
         if (v[4] != M_PROOF || v[5] || size != 32 || m_u64(v + 8)) return -1;
     } else if (f->local) {
-        if (v[4] != M_ACK || v[5] != (unsigned int)f->protocol ||
-            size != 4 || m_u64(v + 8) != f->id) return -1;
+        unsigned int kind = f->waiting_resume ? M_RESUME_ACK : M_ACK;
+        size_t expected = f->waiting_resume ? M_RESUME_SIZE : 4;
+        if (v[4] != kind || v[5] != (unsigned int)f->protocol ||
+            size != expected || m_u64(v + 8) != f->id) return -1;
     } else {
-        if (!f->peer->ready || !f->peer->proof_ready || v[4] != M_OPEN ||
+        if (!f->peer->ready || !f->peer->proof_ready ||
+            (v[4] != M_OPEN && v[4] != M_RESUME) ||
             (v[5] != OB_REMOTE_TCP && v[5] != OB_REMOTE_UDP) || size < 3) return -1;
         uint64_t id = m_u64(v + 8);
-        if (!id || (id & 1U) != (unsigned int)(f->peer->is_server != 0) ||
-            m_find(f->peer, id)) return -1;
+        if (!id || (id & 1U) != (unsigned int)(f->peer->is_server != 0)) return -1;
+        if (v[4] == M_RESUME) {
+            if (f->peer->wire_version != 2 || v[5] != OB_REMOTE_TCP || size != M_RESUME_SIZE)
+                return -1;
+        } else {
+            if (m_find(f->peer, id) ||
+                m_data_flow_count(f->peer) >= m_limit(f->peer->max_flows, 128U, M_FLOWS)) return -1;
+            f->transient = 0;
+        }
         f->id = id; f->protocol = (ob_remote_protocol)v[5];
+        f->wire_version = f->peer->wire_version;
     }
     f->control_need = M_HEADER + size;
     return 0;
@@ -446,6 +507,8 @@ static int m_control_done(struct ob_flow *f)
         }
         return 0;
     }
+    if (f->control[4] == M_RESUME || f->control[4] == M_RESUME_ACK)
+        return m_v2_control_done(f);
     if (f->local) {
         const unsigned char *r = f->control + M_HEADER;
         if (r[0] || r[1] || r[2] || r[3]) return -1;
@@ -520,7 +583,11 @@ static void m_stream_read(struct ob_flow *f)
             if (fin || n == 0) return;
         }
     }
-    if (f->phase != M_ACTIVE || f->stream_eof) return;
+    if (f->phase != M_ACTIVE) return;
+    if (!f->proof && f->protocol == OB_REMOTE_TCP && f->wire_version == 2) {
+        m_v2_read(f); return;
+    }
+    if (f->stream_eof) return;
     if (f->proof || f->protocol == OB_REMOTE_UDP) {
         unsigned char extra;
         uint8_t fin = 0;
@@ -551,6 +618,7 @@ static void m_stream_read(struct ob_flow *f)
 }
 static void m_tcp_write(struct ob_flow *f)
 {
+    if (f->wire_version == 2) { m_v2_write(f); return; }
     if (!f->stream || f->close_requested || f->phase != M_ACTIVE ||
         !f->acked) return;
     if (f->tx_pos < f->tx_len) {
@@ -574,6 +642,7 @@ static void m_tcp_write(struct ob_flow *f)
 }
 static void m_tcp_tick(struct ob_flow *f)
 {
+    if (f->wire_version == 2) { m_v2_tick(f); return; }
     if (f->phase != M_ACTIVE || !f->acked || f->fd < 0) return;
     struct pollfd pollfd = { .fd = f->fd, .events = 0, .revents = 0 };
     if (!f->socket_eof && f->tx_len < OB_STREAM_BUFFER) pollfd.events |= POLLIN;
@@ -612,6 +681,8 @@ static void m_tcp_tick(struct ob_flow *f)
         close(f->fd); f->fd = -1;
     }
 }
+#include "mapping_v2.inc"
+
 static void m_udp_enqueue(struct ob_flow *f, const unsigned char *data, size_t len)
 {
     if ((len && !data) || len > M_UDP_MAX || f->udp_count >= M_UDP_QUEUE ||
@@ -694,10 +765,18 @@ static struct ob_flow *m_local_flow(ob_remote_map *map, int fd,
     struct ob_flow *f = m_flow_new(p);
     if (!f) return NULL;
     f->local = 1; f->protocol = map->protocol; f->map = map;
+    f->wire_version = p->wire_version;
     if (p->next_flow_id >= UINT64_MAX / 2U) { m_flow_free(f); return NULL; }
     f->id = (++p->next_flow_id << 1) | (uint64_t)!p->is_server;
     if (source) { f->source = *source; f->source_len = source_len; }
     if (f->protocol == OB_REMOTE_TCP && m_tcp_buffers(f)) { m_flow_free(f); return NULL; }
+    if (f->protocol == OB_REMOTE_TCP && (!p->ready || !p->proof_ready ||
+        atomic_load(&p->attempt_stop) || !p->conn)) {
+        f->pending_open = f->suspended = 1; f->phase = M_ACTIVE;
+        f->grace_deadline_us = ob_now_us() + (uint64_t)p->timeout_ms * 1000;
+        f->fd = fd;
+        return f;
+    }
     /* The caller retains fd ownership until allocation and stream creation succeed. */
     size_t len = strlen(map->target_host);
     m_header(f->reply, M_OPEN, (unsigned int)f->protocol, len + 2, f->id);
@@ -730,8 +809,12 @@ static void m_map_tick(ob_remote_map *map, unsigned int *budget)
         socklen_t len = sizeof(source);
         memset(&source, 0, sizeof(source));
         ssize_t n = recvfrom(map->fd, s->udp, sizeof(s->udp), 0, (struct sockaddr *)&source, &len);
-        if (n < 0) return;
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) map->udp_draining = 0;
+            return;
+        }
         --*budget;
+        if (map->udp_draining) continue;
         if ((size_t)n > M_UDP_MAX || len > sizeof(source) ||
             (source.ss_family != AF_INET && source.ss_family != AF_INET6)) continue;
         struct ob_flow *f;
@@ -751,7 +834,8 @@ static void m_udp_read(xqc_connection_t *conn, void *data_user,
 {
     (void)conn; (void)timestamp;
     ob_remote_peer *p = data_user;
-    if (!p || !p->ready || !p->proof_ready || len < M_DHEADER) return;
+    if (!p || p->conn != conn || !p->ready || !p->proof_ready ||
+        atomic_load(&p->attempt_stop) || p->transport_detaching || len < M_DHEADER) return;
     const unsigned char *v = data;
     if (memcmp(v, "OBD1", 4) || m_u16(v + 26)) return;
     uint64_t id = m_u64(v + 4), packet = m_u64(v + 12);
@@ -811,9 +895,14 @@ static void m_udp_read(xqc_connection_t *conn, void *data_user,
 }
 static xqc_int_t m_create(xqc_stream_t *stream, void *data)
 {
-    if (data) { ((struct ob_flow *)data)->stream = stream; return 0; }
+    if (data) {
+        struct ob_flow *f = data;
+        f->stream = stream; f->stream_generation = f->peer->transport_generation;
+        return 0;
+    }
     ob_remote_peer *p = xqc_get_conn_user_data_by_stream(stream);
-    if (!p) return -1;
+    if (!p || atomic_load(&p->stop) || atomic_load(&p->attempt_stop) ||
+        p->transport_detaching) return -1;
     int proof = !p->ready;
     M_TRACE("mapping incoming role=%d sid=%llu proof=%d tls=%d\n", p->is_server,
             (unsigned long long)xqc_stream_id(stream), proof, p->tls_ready);
@@ -826,10 +915,10 @@ static xqc_int_t m_create(xqc_stream_t *stream, void *data)
     if (!s || (proof && s->proof_started)) return -1;
     /* The extra context allowance belongs to authentication, never an extra
      * forwarding socket after the proof stream has been reclaimed. */
-    if (!proof && m_data_flow_count(p) >= m_limit(p->max_flows, 128U, M_FLOWS)) return -1;
     struct ob_flow *f = m_flow_new(p);
     if (!f) return -1;
-    f->proof = proof; f->stream = stream;
+    f->proof = proof; f->stream = stream; f->transient = !proof;
+    f->stream_generation = p->transport_generation;
     if (proof) s->proof_started = 1;
     xqc_stream_set_user_data(stream, f); return 0;
 }
@@ -849,11 +938,13 @@ static xqc_int_t m_close(xqc_stream_t *stream, void *data)
 {
     (void)stream;
     struct ob_flow *f = data;
-    if (!f) return 0;
+    if (!f || f->stream != stream ||
+        f->stream_generation != f->peer->transport_generation) return 0;
     M_TRACE("mapping close role=%d flow=%llu phase=%d eof=%d/%d fin=%d stop=%d\n",
             f->peer->is_server, (unsigned long long)f->id, f->phase,
             f->socket_eof, f->stream_eof, f->sent_fin, atomic_load(&f->peer->stop));
     f->stream = NULL;
+    if (f->peer->transport_detaching || atomic_load(&f->peer->attempt_stop)) return 0;
     if (f->proof && !f->peer->ready && !f->proof_reply_ready &&
         !atomic_load(&f->peer->stop))
         m_fail(f->peer, OB_REMOTE_EAUTH, "connection proof stream closed prematurely");
@@ -872,7 +963,9 @@ static void m_reset(xqc_stream_t *stream, xqc_int_t error, void *data)
 {
     (void)stream; (void)error;
     struct ob_flow *f = data;
-    if (!f) return;
+    if (!f || f->stream != stream ||
+        f->stream_generation != f->peer->transport_generation ||
+        f->peer->transport_detaching || atomic_load(&f->peer->attempt_stop)) return;
     M_TRACE("mapping reset role=%d flow=%llu error=%d\n", f->peer->is_server,
             (unsigned long long)f->id, error);
     if (f->proof && !f->peer->ready) m_fail(f->peer, OB_REMOTE_EAUTH, "connection proof stream reset");
@@ -922,6 +1015,8 @@ void ob_mapping_handshake(ob_remote_peer *p)
 void ob_mapping_tick(ob_remote_peer *p)
 {
     if (atomic_load(&p->stop)) { m_stop_io(p); return; }
+    if (atomic_load(&p->attempt_stop)) return;
+    ob_mapping_recovery_tick(p, ob_now_us());
     struct m_state *s = m_state_get(p);
     if (!s) return;
     uint64_t now = ob_now_us();
@@ -938,6 +1033,7 @@ void ob_mapping_tick(ob_remote_peer *p)
     }
     for (struct ob_flow *f = p->flows, *next; f; f = next) {
         next = f->next;
+        if (atomic_load(&p->attempt_stop)) return;
         if (f->close_requested || atomic_load(&p->stop)) {
             m_abort(f);
             if (!f->stream) m_flow_free(f);
@@ -947,8 +1043,14 @@ void ob_mapping_tick(ob_remote_peer *p)
             if (!f->stream) m_flow_free(f);
             continue;
         }
-        if (!f->proof && f->phase != M_ACTIVE &&
-            m_expired(now, f->created, M_SETUP_US)) { m_abort(f); continue; }
+        if (f->suspended && !f->waiting_resume) continue;
+        if (!f->proof && f->phase != M_ACTIVE && m_expired(now, f->created, M_SETUP_US)) {
+            if (f->waiting_resume) {
+                ob_peer_transport_fail_locked(p, OB_REMOTE_ETIMEOUT, "TCP resume handshake timed out");
+                return;
+            }
+            m_abort(f); continue;
+        }
         if (f->phase == M_RESOLVING) m_resolve_tick(f);
         if (f->phase == M_CONNECTING) {
             struct pollfd fd = { .fd = f->fd, .events = POLLOUT, .revents = 0 };
@@ -989,6 +1091,8 @@ void ob_mapping_tick(ob_remote_peer *p)
     }
     m_resolve_reap(p);
 }
+#include "mapping_recovery.inc"
+
 /* Engine-owned immediate revocation: no resolver/HTTP joins and no freeing
  * public map handles. Final cleanup follows after the QUIC engine exits. */
 static void m_stop_io(ob_remote_peer *p)
@@ -1059,7 +1163,7 @@ static int m_portmap(ob_remote_peer *p, const char *local_host,
         ipv6->sin6_family = AF_INET6; ipv6->sin6_port = htons(local_port); address_len = sizeof(*ipv6);
     } else return ob_error(error, OB_REMOTE_EINVAL, 0, "local interface must be a numeric IPv4 or IPv6 address");
     pthread_mutex_lock(&p->mu);
-    if (!p->ready || !p->proof_ready || atomic_load(&p->stop)) {
+    if (atomic_load(&p->stop) || (!p->managed && (!p->ready || !p->proof_ready))) {
         pthread_mutex_unlock(&p->mu);
         return ob_error(error, OB_REMOTE_ECLOSED, 0, "peer is not authenticated and ready");
     }

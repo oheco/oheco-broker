@@ -1,11 +1,11 @@
 # syntax=docker/dockerfile:1
-# Build context: the complete v0.3.0 application tree (including sdk/c/tpr and
+# Build context: the complete application release tree (including sdk/c/tpr and
 # vendor). This recipe may be supplied separately from that immutable tree.
 # Both index digests include native linux/amd64 and linux/arm64 images.
 FROM golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195 AS builder
 
-ARG APP_VERSION=0.3.0
-ARG SOURCE_REVISION=aecc2fd8247aec361e5573412b7bfd6e75a83127
+ARG APP_VERSION=0.4.0
+ARG SOURCE_REVISION
 ARG NATIVE_JOBS=4
 ENV CC=gcc CXX=g++ CGO_ENABLED=1 \
     GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local GOFLAGS=-mod=vendor \
@@ -21,7 +21,8 @@ COPY . .
 
 # SQLite needs cgo, but this independent command must not link the client SDK.
 # Run before sourcing remote.env, and explicitly clear any inherited cgo flags.
-RUN CGO_CFLAGS= CGO_CPPFLAGS= CGO_CXXFLAGS= CGO_LDFLAGS= \
+RUN python3 -c 'import re,sys; assert re.fullmatch(r"[0-9a-f]{40}", sys.argv[1]), "SOURCE_REVISION must identify the supplied release source"' "$SOURCE_REVISION" \
+    && CGO_CFLAGS= CGO_CPPFLAGS= CGO_CXXFLAGS= CGO_LDFLAGS= \
     go build -buildvcs=false -trimpath -o /out/oheco-broker-server ./cmd/oheco-broker-server \
     && test "$(/out/oheco-broker-server --version)" = "oheco-broker-server ${APP_VERSION}"
 
@@ -64,7 +65,12 @@ RUN . /build/sdk/remote-sdk/remote.env \
     && python3 -B tests/remote_acceptance.py --fixture /build/control-fixture \
         --native /build/sdk/remote-sdk/remote_peer_test --api-test /build/remote-api-test \
         --binary /out/oheco-broker \
-    && python3 -B tests/peer_lifecycle.py --fixture /build/control-fixture --binary /out/oheco-broker
+    && python3 -B tests/peer_lifecycle.py --fixture /build/control-fixture --binary /out/oheco-broker \
+    && if [ -f tests/peer_recovery.py ]; then \
+         python3 -B tests/peer_recovery.py --fixture /build/control-fixture \
+           --native /build/sdk/remote-sdk/recovery_peer_test \
+           --preload /build/sdk/remote-sdk/udp_fault_preload.so; \
+       fi
 
 # Keep the original project, Go runtime, and vendored dependency notices. Debian
 # runtime package copyright files remain in /usr/share/doc in the final stage.
@@ -89,8 +95,8 @@ shutil.copy2(root / 'vendor/modules.txt', out / 'go-vendor-modules.txt')
 PY
 
 FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
-ARG APP_VERSION=0.3.0
-ARG SOURCE_REVISION=aecc2fd8247aec361e5573412b7bfd6e75a83127
+ARG APP_VERSION=0.4.0
+ARG SOURCE_REVISION
 LABEL org.opencontainers.image.title="oheco-broker" \
       org.opencontainers.image.description="Independent SQLite/TLS/STUN-TURN server and native C SDK broker CLI" \
       org.opencontainers.image.version="${APP_VERSION}" \

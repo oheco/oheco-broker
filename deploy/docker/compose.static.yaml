@@ -2,7 +2,7 @@
 # Mount the whole exported certificate directory so renewal replaces are visible.
 services:
   broker:
-    image: ${BROKER_IMAGE:-ghcr.io/oheco/oheco-broker:0.3.0}
+    image: ${BROKER_IMAGE:-ghcr.io/oheco/oheco-broker:0.4.0}
     user: "10001:10001"
     network_mode: host
     restart: unless-stopped

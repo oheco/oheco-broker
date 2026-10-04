@@ -12,20 +12,23 @@
 
 static void ice_state(juice_agent_t *agent, juice_state_t state, void *data)
 {
-    (void)agent; ob_remote_peer *p = data;
+    ob_remote_peer *p = data;
+    if (agent != p->ice || atomic_load(&p->stop) || atomic_load(&p->attempt_stop)) return;
     atomic_store(&p->ice_ready, state == JUICE_STATE_CONNECTED || state == JUICE_STATE_COMPLETED);
     if (state == JUICE_STATE_FAILED) atomic_store(&p->ice_failed, 1);
     ob_wake(p);
 }
 static void ice_gathered(juice_agent_t *agent, void *data)
 {
-    (void)agent; ob_remote_peer *p = data;
+    ob_remote_peer *p = data;
+    if (agent != p->ice || atomic_load(&p->stop) || atomic_load(&p->attempt_stop)) return;
     atomic_store(&p->gathered, 1); ob_wake(p);
 }
 static void ice_receive(juice_agent_t *agent, const char *bytes, size_t size, void *data)
 {
-    (void)agent; ob_remote_peer *p = data;
-    if (atomic_load(&p->stop) || size > OB_PACKET_SIZE || !size) return;
+    ob_remote_peer *p = data;
+    if (agent != p->ice || atomic_load(&p->stop) || atomic_load(&p->attempt_stop)
+        || size > OB_PACKET_SIZE || !size) return;
     struct ob_packet *packet = malloc(sizeof(*packet)+size);
     if (!packet) return;
     packet->next = NULL; packet->len = size; memcpy(packet->data, bytes, size);
@@ -56,7 +59,8 @@ static ssize_t write_socket(const unsigned char *buf, size_t size,
                             const struct sockaddr *addr, socklen_t len, void *data)
 {
     (void)addr; (void)len; ob_remote_peer *p = data;
-    if (!p || atomic_load(&p->stop) || !ob_force_path(p)) return XQC_SOCKET_ERROR;
+    if (!p || atomic_load(&p->stop) || atomic_load(&p->attempt_stop)
+        || p->transport_detaching || !ob_force_path(p)) return XQC_SOCKET_ERROR;
     int rc = juice_send(p->ice, (const char *)buf, size);
     return rc == JUICE_ERR_SUCCESS ? (ssize_t)size
         : rc == JUICE_ERR_AGAIN ? XQC_SOCKET_EAGAIN : XQC_SOCKET_ERROR;
@@ -83,7 +87,8 @@ static int accept_conn(xqc_engine_t *engine, xqc_connection_t *conn,
                        const xqc_cid_t *cid, void *data)
 {
     (void)engine; ob_remote_peer *p = data;
-    if (p->conn || atomic_load(&p->stop)) return -1;
+    if (p->conn || atomic_load(&p->stop) || atomic_load(&p->attempt_stop)
+        || p->transport_detaching) return -1;
     p->conn = conn; p->cid = *cid; xqc_conn_set_transport_user_data(conn, p);
     xqc_datagram_set_user_data(conn, p); return 0;
 }
@@ -97,19 +102,26 @@ static int conn_create(xqc_connection_t *conn, const xqc_cid_t *cid, void *data,
 }
 static int conn_close(xqc_connection_t *conn, const xqc_cid_t *cid, void *data, void *proto)
 {
-    (void)conn; (void)cid; (void)proto; ob_remote_peer *p = data;
-    p->conn = NULL; ob_peer_fail_locked(p, OB_REMOTE_ECLOSED, "QUIC connection closed"); return 0;
+    (void)cid; (void)proto; ob_remote_peer *p = data;
+    if (p->conn != conn) return 0;
+    p->conn = NULL;
+    if (!p->transport_detaching && !atomic_load(&p->stop))
+        ob_peer_transport_fail_locked(p, OB_REMOTE_EQUIC, "QUIC connection closed");
+    return 0;
 }
 static xqc_int_t conn_closing(xqc_connection_t *conn, const xqc_cid_t *cid,
                               xqc_int_t code, void *data)
 {
-    (void)conn; (void)cid; (void)code;
-    ob_peer_fail_locked(data, OB_REMOTE_ECLOSED, "QUIC connection closing"); return 0;
+    (void)cid; (void)code; ob_remote_peer *p = data;
+    if (p->conn == conn && !p->transport_detaching && !atomic_load(&p->stop))
+        ob_peer_transport_fail_locked(p, OB_REMOTE_EQUIC, "QUIC connection closing");
+    return 0;
 }
 void ob_peer_handshake(xqc_connection_t *conn, void *data, void *proto)
 {
     (void)proto; ob_remote_peer *p = data;
-    if (atomic_load(&p->stop)) return;
+    if (p->conn != conn || atomic_load(&p->stop) || atomic_load(&p->attempt_stop)
+        || p->transport_detaching) return;
     /* Both roles gate the actual authenticated peer transport parameters.
      * Never emit the exporter proof or enable any application traffic first. */
     if (!ob_connection_encrypted(conn)) {
@@ -154,9 +166,14 @@ static int engine_init(ob_remote_peer *p)
     /* xquic OWNS and frees alp_ctx during engine destruction. The peer is
      * caller-owned, so never hand it over as an ALPN allocation context. */
     if (xqc_engine_register_alpn(p->engine, OB_ALPN, strlen(OB_ALPN), &app, NULL)) return -1;
-    xqc_conn_settings_t settings = {0}; settings.ping_on = 1;
+    xqc_conn_settings_t settings = {0}; settings.ping_on = p->wire_version == 1;
     settings.proto_version = XQC_VERSION_V1; settings.init_idle_time_out = p->timeout_ms;
-    settings.idle_time_out = 90000; settings.max_datagram_frame_size = 65535;
+    /* v2 peers negotiate a responsive loss timeout with standard QUIC PING
+     * keepalive. v1 keeps its original 90s timeout for older client cadence. */
+    p->transport_idle_ms = p->wire_version == 2 ? p->recovery.policy.transport_timeout_ms : 90000;
+    p->next_ping_us = 0;
+    settings.idle_time_out = p->transport_idle_ms;
+    settings.max_datagram_frame_size = 65535;
     settings.max_pkt_out_size = 1350; settings.max_streams_bidi = p->max_flows + 1;
     /* xquic interprets zero stream limits as defaults. Advertise at most one
      * unidirectional stream; the application rejects even that first stream. */
@@ -182,66 +199,97 @@ static int engine_init(ob_remote_peer *p)
     }
     return 0;
 }
+/* The owner retires every QUIC callback binding before the coordinator may
+ * destroy ICE or replace credentials. It stays alive while recovery is paused. */
+static void transport_detach(ob_remote_peer *p)
+{
+    p->transport_detaching = 1;
+    ob_mapping_transport_suspend(p, p->wire_version == 2,
+                                  p->recovery_deadline_us);
+    if (p->conn) xqc_conn_close_with_error(p->conn, 1);
+    if (p->engine) xqc_engine_destroy(p->engine);
+    p->engine = NULL; p->conn = NULL; p->next_timer_us = 0;
+    p->ready = p->tls_ready = p->proof_ready = 0;
+    p->transport_detaching = 0; p->transport_detached = 1;
+    pthread_cond_broadcast(&p->cv);
+}
 void *ob_engine_worker(void *data)
 {
     ob_remote_peer *p = data;
-    pthread_mutex_lock(&p->mu);
-    if (engine_init(p)) ob_peer_fail_locked(p, OB_REMOTE_EQUIC, "QUIC engine initialization failed");
-    pthread_mutex_unlock(&p->mu);
     while (!atomic_load(&p->stop)) {
-        /* Honor xquic's scheduled wakeup with a 1ms timer quantum, while
-         * polling application sockets at least once every 10ms. */
-        int wait_ms = 10; uint64_t before_poll = ob_now_us();
-        if (p->next_timer_us) {
-            uint64_t delay = p->next_timer_us > before_poll
-                ? (p->next_timer_us-before_poll+999)/1000 : 1;
-            if (!delay) delay = 1;
-            if (delay < 10) wait_ms = (int)delay;
-        }
-        struct pollfd fd = {p->wake[0], POLLIN, 0}; poll(&fd, 1, wait_ms);
-        unsigned char bytes[64]; while (read(p->wake[0], bytes, sizeof(bytes)) > 0) {}
+        int wait_ms = 10;
         pthread_mutex_lock(&p->mu);
         uint64_t now = ob_now_us();
         if (p->is_server && p->server && atomic_load(&p->server->stop))
             ob_peer_fail_locked(p, OB_REMOTE_ECLOSED, "Broker stopped or revoked");
-        if (atomic_load(&p->ice_failed) || !atomic_load(&p->ice_ready) || !ob_force_path(p))
-            ob_peer_fail_locked(p, OB_REMOTE_EICE, "ICE association lost or relay policy failed");
-        if (!p->ready && now >= p->deadline_us)
-            ob_peer_fail_locked(p, OB_REMOTE_ETIMEOUT, "Peer setup timed out");
-        if (p->lease_deadline_set && now >= p->lease_deadline_us)
-            ob_peer_fail_locked(p, OB_REMOTE_ECLOSED, "Control authorization lease expired");
-        pthread_mutex_lock(&p->qmu);
-        struct ob_packet *packet = p->qhead; p->qhead = p->qtail = NULL; p->qcount = 0;
-        pthread_mutex_unlock(&p->qmu);
-        while (packet) {
-            struct ob_packet *next = packet->next;
-            if (!atomic_load(&p->stop)) xqc_engine_packet_process(p->engine, packet->data,
-                packet->len, (struct sockaddr *)&p->logical_local, sizeof(p->logical_local),
-                (struct sockaddr *)&p->logical_peer, sizeof(p->logical_peer), now, p);
-            free(packet); packet = next;
-        }
-        if (!atomic_load(&p->stop)) {
-            xqc_engine_finish_recv(p->engine); ob_mapping_tick(p);
-            /* Application writes outside receive callbacks can activate a
-             * connection without changing the old wakeup timer. Drain that
-             * work now, while also servicing due transport timers. */
-            xqc_engine_main_logic(p->engine);
-            if (p->conn && !atomic_load(&p->stop)) xqc_conn_continue_send(p->engine, &p->cid);
+        if (atomic_load(&p->attempt_stop) || !p->transport_available) {
+            if (!p->transport_detached) transport_detach(p);
+            ob_mapping_recovery_tick(p, now);
+        } else if (!p->engine) {
+            p->transport_detached = 0;
+            if (engine_init(p))
+                ob_peer_transport_fail_locked(p, OB_REMOTE_EQUIC,
+                                              "QUIC engine initialization failed");
+        } else {
+            if (atomic_load(&p->ice_failed) || !atomic_load(&p->ice_ready) || !ob_force_path(p))
+                ob_peer_transport_fail_locked(p, OB_REMOTE_EICE,
+                                             "ICE association lost or relay policy failed");
+            if (!p->ready && now >= p->deadline_us)
+                ob_peer_transport_fail_locked(p, OB_REMOTE_ETIMEOUT, "Peer setup timed out");
+            if (p->lease_deadline_set && now >= p->lease_deadline_us)
+                ob_peer_transport_fail_locked(p, OB_REMOTE_ECLOSED,
+                                             "Control authorization lease expired");
+            pthread_mutex_lock(&p->qmu);
+            struct ob_packet *packet = p->qhead;
+            p->qhead = p->qtail = NULL; p->qcount = 0;
+            pthread_mutex_unlock(&p->qmu);
+            while (packet) {
+                struct ob_packet *next = packet->next;
+                if (!atomic_load(&p->stop) && !atomic_load(&p->attempt_stop))
+                    xqc_engine_packet_process(p->engine, packet->data, packet->len,
+                        (struct sockaddr *)&p->logical_local, sizeof(p->logical_local),
+                        (struct sockaddr *)&p->logical_peer, sizeof(p->logical_peer), now, p);
+                free(packet); packet = next;
+            }
+            if (!atomic_load(&p->stop) && !atomic_load(&p->attempt_stop)) {
+                xqc_engine_finish_recv(p->engine);
+                if (!atomic_load(&p->attempt_stop)) ob_mapping_tick(p);
+                /* The pinned upstream PING timer is fixed at 15s. v2 uses an
+                 * owner-scheduled standard PING on both roles, below the actual
+                 * negotiated idle timeout even when users select 1..3s. */
+                if (p->wire_version == 2 && p->tls_ready && p->conn &&
+                    !atomic_load(&p->attempt_stop) && (!p->next_ping_us || now >= p->next_ping_us)) {
+                    uint64_t interval = (uint64_t)p->transport_idle_ms * 1000 / 3;
+                    if (interval > 5000000) interval = 5000000;
+                    (void)xqc_conn_send_ping(p->engine, &p->cid, NULL);
+                    p->next_ping_us = now + interval;
+                }
+                if (!atomic_load(&p->attempt_stop)) xqc_engine_main_logic(p->engine);
+                if (p->conn && !atomic_load(&p->stop) && !atomic_load(&p->attempt_stop))
+                    xqc_conn_continue_send(p->engine, &p->cid);
+            }
+            if (atomic_load(&p->attempt_stop) && !p->transport_detached)
+                transport_detach(p);
+            if (p->next_timer_us) {
+                uint64_t delay = p->next_timer_us > now ?
+                    (p->next_timer_us - now + 999) / 1000 : 1;
+                if (delay < 10) wait_ms = delay ? (int)delay : 1;
+            }
         }
         pthread_mutex_unlock(&p->mu);
+        struct pollfd fd = {p->wake[0], POLLIN, 0};
+        (void)poll(&fd, 1, wait_ms);
+        unsigned char bytes[64];
+        while (read(p->wake[0], bytes, sizeof(bytes)) > 0) {}
     }
     pthread_mutex_lock(&p->mu);
-    /* stop is already set. The stop branch aborts every flow and closes its
-     * socket immediately, before any control or DNS worker can delay joins. */
     ob_mapping_tick(p);
+    p->transport_detaching = 1;
     if (p->conn) xqc_conn_close_with_error(p->conn, 1);
-    if (p->engine) { xqc_engine_destroy(p->engine); p->engine = NULL; p->conn = NULL; }
-    /* Listener handles remain valid after asynchronous revocation until the
-     * caller closes them or destroys the peer. Stop forwarding immediately. */
-    for (ob_remote_map *map = p->maps; map; map = map->next) {
-        if (map->fd >= 0) { close(map->fd); map->fd = -1; }
-        map->closed = 1;
-    }
+    if (p->engine) xqc_engine_destroy(p->engine);
+    p->engine = NULL; p->conn = NULL; p->transport_detached = 1;
+    p->transport_detaching = 0;
     pthread_cond_broadcast(&p->cv);
-    pthread_mutex_unlock(&p->mu); return NULL;
+    pthread_mutex_unlock(&p->mu);
+    return NULL;
 }

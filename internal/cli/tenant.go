@@ -348,9 +348,11 @@ func parseRule(value string) (remote.Rule, error) {
 }
 func serveCommand(o *rootOptions) *cobra.Command {
 	var name, password, policyFile, stun string
-	var stdin bool
+	var stdin, stateEvents bool
 	var values []string
 	cmd := &cobra.Command{Use: "serve", Args: cobra.NoArgs, Short: "Run a registered broker with a local target allowlist", RunE: func(cmd *cobra.Command, _ []string) error {
+		requests, stopRequests := peerReconnectSignals()
+		defer stopRequests()
 		if name == "" {
 			return errors.New("--name is required")
 		}
@@ -401,18 +403,7 @@ func serveCommand(o *rootOptions) *cobra.Command {
 		}
 		defer server.Close()
 		_ = json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]any{"event": "broker_ready", "broker_id": server.ID(), "name": name, "allow_rules": len(rules)})
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-cmd.Context().Done():
-				return nil
-			case <-ticker.C:
-				if err = server.Status(); err != nil {
-					return err
-				}
-			}
-		}
+		return monitorPeer(cmd, server, "broker", stateEvents, requests)
 	}}
 	cmd.Flags().StringVar(&name, "name", "", "Unique broker name within your tenant")
 	cmd.Flags().StringVar(&password, "password", "", "Private peer password; never sent to management API")
@@ -420,12 +411,15 @@ func serveCommand(o *rootOptions) *cobra.Command {
 	cmd.Flags().StringVar(&policyFile, "allow-config", "", "JSON target policy: {\"allow\":[{\"host\":...,\"port\":...,\"protocol\":\"tcp\"}]}")
 	cmd.Flags().StringSliceVar(&values, "allow", nil, "Explicit target, e.g. tcp@127.0.0.1:8080 (repeatable)")
 	cmd.Flags().StringVar(&stun, "stun", "", "STUN host:port override; default discovered from control plane")
+	cmd.Flags().BoolVar(&stateEvents, "state-events", false, "Emit redacted JSON recovery transitions; SIGUSR1 requests manual recovery")
 	return cmd
 }
 func connectCommand(o *rootOptions) *cobra.Command {
 	var name, id, password, protocol, target, local, relay, stun string
-	var stdin bool
+	var stdin, stateEvents bool
 	cmd := &cobra.Command{Use: "connect", Args: cobra.NoArgs, Short: "Authenticate a peer and expose one fixed TCP/UDP mapping", RunE: func(cmd *cobra.Command, _ []string) error {
+		requests, stopRequests := peerReconnectSignals()
+		defer stopRequests()
 		if (name == "") == (id == "") {
 			return errors.New("choose exactly one --name or --broker-id")
 		}
@@ -505,18 +499,7 @@ func connectCommand(o *rootOptions) *cobra.Command {
 		}
 		defer mapping.Close()
 		_ = json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]any{"event": "mapping_ready", "protocol": protocol, "local": net.JoinHostPort(localHost, strconv.Itoa(int(mapping.Port()))), "broker_id": id, "target": target, "relay_mode": relay})
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-cmd.Context().Done():
-				return nil
-			case <-ticker.C:
-				if err = peer.Status(); err != nil {
-					return err
-				}
-			}
-		}
+		return monitorPeer(cmd, peer, "peer", stateEvents, requests)
 	}}
 	f := cmd.Flags()
 	f.StringVar(&name, "name", "", "Broker name")
@@ -528,5 +511,6 @@ func connectCommand(o *rootOptions) *cobra.Command {
 	f.StringVar(&local, "local", "0", "Local port or numeric IP:port; default random loopback port")
 	f.StringVar(&relay, "relay", "auto", "auto, never, force")
 	f.StringVar(&stun, "stun", "", "STUN host:port override")
+	f.BoolVar(&stateEvents, "state-events", false, "Emit redacted JSON recovery transitions; SIGUSR1 requests manual recovery")
 	return cmd
 }

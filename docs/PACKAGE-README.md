@@ -1,4 +1,4 @@
-# oheco-broker 0.3.0 — HarmonyOS arm64
+# oheco-broker 0.4.0 — HarmonyOS arm64
 
 Authenticated peer TCP/UDP mappings with SQLite management, WS/WSS signaling and standalone STUN/TURN. The package includes executable commands and **source SDKs**; it does not distribute prebuilt SDK libraries.
 
@@ -14,7 +14,7 @@ Authenticated peer TCP/UDP mappings with SQLite management, WS/WSS signaling and
 
 `bin/oheco-broker-server` is a separate signed ELF for the SQLite management, HTTPS/WSS and UDP STUN/TURN backend. It needs the system C runtime, and does not load the native peer SDK or C++ runtime. Run the platform-matching server executable; a Linux server is built natively from the full source checkout.
 
-Installation does not start a service or configure system startup. Through oheco, use `oheco-broker` and `oheco-broker-server`; `oheco-broker@0.3.0` selects the client version. No arguments show help. The legacy local command service requires explicit `oheco-broker shell serve`.
+Installation does not start a service or configure system startup. Through oheco, use `oheco-broker` and `oheco-broker-server`; `oheco-broker@0.4.0` selects the client version. No arguments show help. The legacy local command service requires explicit `oheco-broker shell serve`.
 
 ## Source SDKs
 
@@ -23,7 +23,9 @@ Installation does not start a service or configure system startup. Through oheco
 - **Go SDK:** `sdk/go/` wraps the same C engine through cgo. Build the C inputs first and supply their include/link settings. The package includes `go.mod`, `go.sum` and `vendor/` for offline Go dependency consumption. A native Go/C toolchain is required for SDK builds, not for running the supplied commands.
 - **.NET SDK:** reference `sdk/dotnet/Oheco.Broker.csproj` or include `BrokerProcess.cs`. It targets .NET 10 without extra NuGet packages and calls the local command service; it is not a remote peer wrapper.
 
-See the SDK READMEs for integration. A host embedding the remote C SDK must provide its platform's C/C++ runtimes even when SDK dependencies are statically linked; the CLI's private runtime does not automatically configure an unrelated host application. Keep the fixed BoringSSL implementation consistent across peer and curl inputs.
+The C and Go peer SDKs retain handles and listening ports across bounded automatic retries, and expose asynchronous manual recovery after retries pause. With both endpoints using mapping v2, live TCP sockets can recover within the configured grace period; UDP drops stale packets. CLI users can request recovery with `SIGUSR1` and observe optional `--state-events`. See `docs/RECONNECT.md` and the SDK READMEs for integration.
+
+A host embedding the remote C SDK must provide its platform's C/C++ runtimes even when SDK dependencies are statically linked; the CLI's private runtime does not automatically configure an unrelated host application. Keep the fixed BoringSSL implementation consistent across peer and curl inputs.
 
 ## Use and boundaries
 

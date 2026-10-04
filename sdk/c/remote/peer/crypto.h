@@ -18,4 +18,6 @@ void ob_peer_handshake(xqc_connection_t *conn, void *data, void *proto);
 int ob_certificate_matches(ob_remote_peer *p, const unsigned char *der, size_t len);
 int ob_make_certificate(ob_remote_peer *p);
 void ob_certificate_cleanup(ob_remote_peer *p);
+int ob_resume_key_derive(ob_remote_peer *p);
+int ob_resume_proof(ob_remote_peer *p, int sender_server, unsigned char out[32]);
 #endif

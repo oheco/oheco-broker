@@ -8,7 +8,7 @@ static uint64_t heartbeat_interval(uint64_t remaining)
 static int peer_cancel(void *arg)
 {
     ob_remote_peer *p = arg; if (p->control_cleanup) return 0;
-    if (atomic_load(&p->stop)) return 1;
+    if (atomic_load(&p->stop) || atomic_load(&p->attempt_stop)) return 1;
     pthread_mutex_lock(&p->mu);
     int cancel = (p->lease_deadline_set && ob_now_us() >= p->lease_deadline_us)
         || (!p->ready && ob_now_us() >= p->deadline_us);
@@ -19,14 +19,30 @@ static int apply_capabilities(ob_remote_peer *p, cJSON *response)
     if (!cJSON_IsObject(response) || discover_stun(p, response)) {
         ob_peer_fail(p, OB_REMOTE_EPROTOCOL, "Invalid pushed capabilities/STUN endpoint"); return OB_REMOTE_EPROTOCOL;
     }
-    if (set_lease(p, response)) { ob_peer_fail(p, OB_REMOTE_ECLOSED, "Control authorization lease expired"); return OB_REMOTE_ECLOSED; }
+    if (set_lease(p, response)) {
+        if (p->control_managed) ob_peer_transport_fail(p, OB_REMOTE_ECLOSED, "Control authorization lease expired");
+        else ob_peer_fail(p, OB_REMOTE_ECLOSED, "Control authorization lease expired");
+        return OB_REMOTE_ECLOSED;
+    }
     p->approved = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(response, "peer_authenticated"));
     return 0;
+}
+static int peer_authorization_error(ob_remote_peer *p, cJSON *body)
+{
+    const char *reason = string(body, "error_code");
+    int terminal = reason && (!strcmp(reason, "connection_revoked") ||
+                              !strcmp(reason, "credential_revoked"));
+    if (!p->control_managed || terminal)
+        ob_peer_fail(p, OB_REMOTE_ECLOSED, "Control authorization was explicitly revoked");
+    else ob_peer_transport_fail(p, OB_REMOTE_ECLOSED, "Control session requires fresh authorization");
+    return OB_REMOTE_ECLOSED;
 }
 static int peer_transport_error(ob_remote_peer *p, const ob_api_error *e)
 {
     if (fatal_status((int)e->http_status)) {
-        ob_peer_fail(p, OB_REMOTE_ECLOSED, "Control session revoked"); return OB_REMOTE_ECLOSED;
+        if (p->control_managed) ob_peer_transport_fail(p, OB_REMOTE_ECLOSED, "Control session requires fresh authorization");
+        else ob_peer_fail(p, OB_REMOTE_ECLOSED, "Control session revoked");
+        return OB_REMOTE_ECLOSED;
     }
     if (e->code == OB_API_JSON || e->code == OB_API_LIMIT || e->code == OB_API_NOMEM) {
         int rc = e->code == OB_API_NOMEM ? OB_REMOTE_ENOMEM : OB_REMOTE_EPROTOCOL;
@@ -60,14 +76,17 @@ static int peer_tick(ob_remote_peer *p, unsigned wait_ms)
     if (rc) return peer_transport_error(p, &e);
     cJSON *j;
     while ((j = ob_ws_pop(p->ws, "revoked"))) {
-        int status = cJSON_GetObjectItemCaseSensitive(j, "status")->valueint; cJSON_Delete(j);
+        int status = cJSON_GetObjectItemCaseSensitive(j, "status")->valueint;
+        cJSON *body = cJSON_GetObjectItemCaseSensitive(j, "body");
         if (status >= 500) {
+            cJSON_Delete(j);
             /* Unavailable authorization is not a fresh grant or proof of
              * invalid identity. Preserve only the old deadline while retrying. */
             ob_ws_disconnect(p->ws); e.code = OB_API_TRANSPORT; e.http_status = status;
             return peer_transport_error(p, &e);
         }
-        ob_peer_fail(p, OB_REMOTE_ECLOSED, "Control session revoked"); return OB_REMOTE_ECLOSED;
+        int authorization = peer_authorization_error(p, body); cJSON_Delete(j);
+        return authorization;
     }
     while ((j = ob_ws_pop(p->ws, "capabilities"))) {
         rc = apply_capabilities(p, cJSON_GetObjectItemCaseSensitive(j, "body")); cJSON_Delete(j); if (rc) return rc;
@@ -77,7 +96,8 @@ static int peer_tick(ob_remote_peer *p, unsigned wait_ms)
         if (ob_ws_result(p->ws, p->heartbeat_id, &status, &body)) {
             p->heartbeat_id = 0;
             if (status >= 200 && status < 300) rc = apply_capabilities(p, body);
-            else if (fatal_status(status)) { ob_peer_fail(p, OB_REMOTE_ECLOSED, "Control heartbeat revoked"); rc = OB_REMOTE_ECLOSED; }
+            else if (fatal_status(status) || (p->control_managed && status == 409))
+                rc = peer_authorization_error(p, body);
             cJSON_Delete(body); if (rc) return rc;
             pthread_mutex_lock(&p->mu); uint64_t lease = p->lease_deadline_us; pthread_mutex_unlock(&p->mu);
             uint64_t now = ob_now_us(); p->heartbeat_due_us = now + heartbeat_interval(lease > now ? lease-now : 0);

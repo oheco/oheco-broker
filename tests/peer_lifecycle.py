@@ -42,7 +42,7 @@ def main():
         def echo_connection(connection, done):
             try:
                 with connection:
-                    connection.settimeout(20)
+                    connection.settimeout(180)
                     while True:
                         data = connection.recv(65536)
                         if not data:
@@ -96,6 +96,20 @@ def main():
                         return item
                 time.sleep(.02)
             raise AssertionError("event timeout: " + path.read_text())
+        def wait_state(process, path, state, timeout=80):
+            end = time.monotonic() + timeout
+            while time.monotonic() < end:
+                if process.poll() is not None:
+                    raise AssertionError("CLI terminated before recovery state: " + path.read_text())
+                for line in path.read_text().splitlines():
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if item.get("event") == "connection_state" and item.get("state") == state:
+                        return item
+                time.sleep(.05)
+            raise AssertionError("CLI recovery state timeout: " + path.read_text())
         def boot(listen=None, turn=None):
             ready_file.unlink(missing_ok=True)
             command = [args.fixture, "--db", str(root / "control.sqlite"), "--ready", str(ready_file),
@@ -135,7 +149,7 @@ def main():
             before = len(closed_events)
             process, log = start([args.binary, "--api", url, "tenant", "connect", "--name", "lifecycle",
                         "--password", password, "--protocol", "tcp", "--target", target,
-                        "--local", "0", "--relay", "never"], label)
+                        "--local", "0", "--relay", "never", "--state-events"], label)
             mapping = wait_event(process, log, "mapping_ready")
             host, port = mapping["local"].rsplit(":", 1)
             connection = socket.create_connection((host, int(port)), timeout=8)
@@ -160,7 +174,7 @@ def main():
             password = secrets.token_hex(16)
             target = "127.0.0.1:" + str(echo.getsockname()[1])
             broker, broker_log = start([args.binary, "--api", url, "tenant", "serve", "--name", "lifecycle",
-                         "--password", password, "--allow", "tcp@" + target], "broker")
+                         "--password", password, "--allow", "tcp@" + target, "--state-events"], "broker")
             broker_id = wait_event(broker, broker_log, "broker_ready")["broker_id"]
             mapping_process, connection, target_closed = connect("lease-mapping")
             before_reconnect = gate()
@@ -190,16 +204,27 @@ def main():
             print("PASS native watcher/session WS reconnect with live QUIC flow; zero REST fallback", flush=True)
             gate({"sessions": True})
             wait_gate("sessions_waiting")
-            started = time.monotonic()
-            eof(connection, 7)
-            if not target_closed.wait(timeout=1) or time.monotonic() - started > 7:
-                raise AssertionError("lease did not close both socket sides during stalled WS heartbeat response")
-            connection.close()
+            # Let the old lease expire. Fresh managed grants may authorize new
+            # transports; an authorized logical TCP flow keeps its target fd.
+            time.sleep(7)
+            if target_closed.is_set() or mapping_process.poll() is not None:
+                raise AssertionError("managed recovery closed an established TCP flow during a heartbeat stall")
             gate({"sessions": False})
+            connection.settimeout(30)
+            connection.sendall(b"after-heartbeat-stall")
+            answer = bytearray()
+            while len(answer) < len(b"after-heartbeat-stall"):
+                block = connection.recv(64)
+                if not block:
+                    raise AssertionError("retained TCP closed after heartbeat recovery")
+                answer.extend(block)
+            if bytes(answer) != b"after-heartbeat-stall" or target_closed.is_set():
+                raise AssertionError("heartbeat recovery lost TCP data or replaced target socket")
+            connection.close()
             stop(mapping_process)
             if broker.poll() is not None:
                 raise AssertionError("broker stopped instead of remaining available after peer lease loss")
-            print("PASS peer lease closes accepted/target TCP while WS heartbeat RPC is stalled", flush=True)
+            print("PASS stalled WS heartbeat recovers authorized transport and preserves existing TCP socket", flush=True)
 
             mapping_process, connection, target_closed = connect("close-mapping")
             gate({"broker": True})
@@ -216,25 +241,31 @@ def main():
             print("PASS explicit broker close stops target I/O during blocked WS heartbeat and bounded close", flush=True)
 
             broker, broker_log = start([args.binary, "--api", url, "tenant", "serve", "--name", "lifecycle",
-                         "--password", password, "--allow", "tcp@" + target], "recovering-broker")
+                         "--password", password, "--allow", "tcp@" + target, "--state-events"], "recovering-broker")
             if wait_event(broker, broker_log, "broker_ready")["broker_id"] != broker_id:
                 raise AssertionError("broker UUID changed on restore")
             mapping_process, connection, target_closed = connect("outage-mapping")
+            mapping_log = root / "outage-mapping.log"
+            target_count = len(closed_events)
             stop(fixture)
-            eof(connection, 7)
-            if not target_closed.wait(timeout=1):
-                raise AssertionError("outage lease left target open")
-            connection.close()
-            stop(mapping_process)
-            # Longer than the entire configured lease, not just one failed poll.
-            time.sleep(6)
-            if broker.poll() is not None:
-                raise AssertionError("broker exited during a transient control outage")
+            # Both real CLI processes exhaust the automatic recovery budget.
+            wait_state(mapping_process, mapping_log, "paused")
+            wait_state(broker, broker_log, "paused")
+            if target_closed.is_set() or len(closed_events) != target_count:
+                raise AssertionError("control outage closed or reopened the retained target socket")
+            if broker.poll() is not None or mapping_process.poll() is not None:
+                raise AssertionError("CLI exited during an automatically paused connection")
             listen = information["api"].removeprefix("http://")
             fixture, restarted = boot(listen, information["turn"])
             if restarted["api"] != url:
                 raise AssertionError("restart endpoint changed")
-            end = time.monotonic() + 15
+            broker.send_signal(signal.SIGUSR1)
+            mapping_process.send_signal(signal.SIGUSR1)
+            if not wait_event(broker, broker_log, "reconnect_requested")["accepted"]:
+                raise AssertionError("broker SIGUSR1 manual request rejected")
+            if not wait_event(mapping_process, mapping_log, "reconnect_requested")["accepted"]:
+                raise AssertionError("peer SIGUSR1 manual request rejected")
+            end = time.monotonic() + 25
             while time.monotonic() < end:
                 status = cli(["tenant", "broker", "show", broker_id])["broker"]
                 if status["online"]:
@@ -242,12 +273,21 @@ def main():
                 time.sleep(.2)
             else:
                 raise AssertionError("broker did not recover the same device identity after control restart")
-            recovered, connection, target_closed = connect("recovered-mapping")
+            connection.settimeout(30)
+            connection.sendall(b"same-socket-after-sigusr1")
+            answer = bytearray()
+            while len(answer) < len(b"same-socket-after-sigusr1"):
+                block = connection.recv(64)
+                if not block:
+                    raise AssertionError("SIGUSR1 manual recovery closed the old application TCP fd")
+                answer.extend(block)
+            if bytes(answer) != b"same-socket-after-sigusr1" or len(closed_events) != target_count or target_closed.is_set():
+                raise AssertionError("SIGUSR1 did not recover the same application/target sockets")
             connection.close()
-            stop(recovered)
+            stop(mapping_process)
             stop(broker)
             stop(fixture)
-            print("PASS broker survives full lease outage and recovers same UUID/new peer after SQLite restart", flush=True)
+            print("PASS real CLI exhausted budgets, then SIGUSR1 restores same UUID/handles/TCP sockets after SQLite restart", flush=True)
         finally:
             for process in reversed(processes):
                 if process.poll() is None:

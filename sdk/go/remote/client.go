@@ -193,6 +193,89 @@ type ConnectOptions struct {
 	MaxMaps, MaxFlows uint32
 	UDPIdleTimeout    time.Duration
 }
+
+// ReconnectPolicy configures the native recovery manager. Zero fields select
+// its defaults; Disabled stops automatic retries without disabling Reconnect.
+type ReconnectPolicy struct {
+	Disabled                                 bool
+	MaxAttempts                              uint32
+	InitialDelay, MaxDelay, TransportTimeout time.Duration
+	RetryBudget, FlowGrace, StableReset      time.Duration
+}
+
+type ConnectionState int
+
+const (
+	StateConnecting   ConnectionState = C.OB_REMOTE_STATE_CONNECTING
+	StateConnected    ConnectionState = C.OB_REMOTE_STATE_CONNECTED
+	StateReconnecting ConnectionState = C.OB_REMOTE_STATE_RECONNECTING
+	StateRetryWait    ConnectionState = C.OB_REMOTE_STATE_RETRY_WAIT
+	StatePaused       ConnectionState = C.OB_REMOTE_STATE_PAUSED
+	StateFailed       ConnectionState = C.OB_REMOTE_STATE_FAILED
+	StateClosed       ConnectionState = C.OB_REMOTE_STATE_CLOSED
+)
+
+func (s ConnectionState) String() string {
+	switch s {
+	case StateConnecting:
+		return "connecting"
+	case StateConnected:
+		return "connected"
+	case StateReconnecting:
+		return "reconnecting"
+	case StateRetryWait:
+		return "retry_wait"
+	case StatePaused:
+		return "paused"
+	case StateFailed:
+		return "failed"
+	case StateClosed:
+		return "closed"
+	default:
+		return "unknown"
+	}
+}
+
+// ConnectionInfo is a copied snapshot. NextRetry is relative to the snapshot;
+// LastError is a redacted native diagnostic and is nil when no error occurred.
+type ConnectionInfo struct {
+	State      ConnectionState
+	Attempts   uint32
+	Generation uint64
+	NextRetry  time.Duration
+	LastError  *Error
+}
+
+func nativeReconnectPolicy(policy ReconnectPolicy) (C.ob_remote_reconnect_policy, error) {
+	if err := validateReconnectPolicy(policy); err != nil {
+		return C.ob_remote_reconnect_policy{}, err
+	}
+	var disabled C.uint32_t
+	if policy.Disabled {
+		disabled = 1
+	}
+	return C.ob_remote_reconnect_policy{
+		struct_size: C.uint32_t(C.sizeof_ob_remote_reconnect_policy), disabled: disabled,
+		max_attempts:         C.uint32_t(policy.MaxAttempts),
+		initial_delay_ms:     C.uint32_t(policy.InitialDelay.Milliseconds()),
+		max_delay_ms:         C.uint32_t(policy.MaxDelay.Milliseconds()),
+		retry_budget_ms:      C.uint32_t(policy.RetryBudget.Milliseconds()),
+		flow_grace_ms:        C.uint32_t(policy.FlowGrace.Milliseconds()),
+		stable_reset_ms:      C.uint32_t(policy.StableReset.Milliseconds()),
+		transport_timeout_ms: C.uint32_t(policy.TransportTimeout.Milliseconds()),
+	}, nil
+}
+
+func connectionInfo(info C.ob_remote_connection_info) ConnectionInfo {
+	result := ConnectionInfo{State: ConnectionState(info.state), Attempts: uint32(info.attempts),
+		Generation: uint64(info.generation), NextRetry: time.Duration(info.next_retry_ms) * time.Millisecond}
+	if info.last_error.code != 0 {
+		result.LastError = &Error{Code: int(info.last_error.code), HTTPStatus: int(info.last_error.http_status),
+			Message: C.GoString(&info.last_error.message[0])}
+	}
+	return result
+}
+
 type Server struct {
 	mu     sync.Mutex
 	ptr    *C.ob_remote_server
@@ -299,6 +382,53 @@ func (s *Server) Status() error {
 	}
 	return nil
 }
+
+// SetReconnectPolicy replaces the native policy. A zero policy restores defaults.
+func (s *Server) SetReconnectPolicy(policy ReconnectPolicy) error {
+	cfg, err := nativeReconnectPolicy(policy)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ptr == nil {
+		return errors.New("remote: server closed")
+	}
+	var diagnostic C.ob_remote_error
+	if C.ob_remote_server_set_reconnect_policy(s.ptr, &cfg, &diagnostic) != 0 {
+		return peerError(&diagnostic)
+	}
+	return nil
+}
+
+func (s *Server) GetConnectionInfo() (ConnectionInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ptr == nil {
+		return ConnectionInfo{State: StateClosed}, errors.New("remote: server closed")
+	}
+	var info C.ob_remote_connection_info
+	if result := C.ob_remote_server_get_state(s.ptr, &info); result != 0 {
+		return ConnectionInfo{}, &Error{Code: int(result), Message: C.GoString(C.ob_remote_strerror(result))}
+	}
+	return connectionInfo(info), nil
+}
+
+// Reconnect is nonblocking: nil means accepted. A healthy server is unchanged;
+// recovery still requires valid credentials and cannot override revocation.
+func (s *Server) Reconnect() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ptr == nil {
+		return errors.New("remote: server closed")
+	}
+	var diagnostic C.ob_remote_error
+	if C.ob_remote_server_reconnect(s.ptr, &diagnostic) != 0 {
+		return peerError(&diagnostic)
+	}
+	return nil
+}
+
 func (s *Server) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -309,6 +439,16 @@ func (s *Server) Close() {
 	}
 }
 func (c *Client) Connect(brokerID, password string, options ConnectOptions) (*Peer, error) {
+	return c.connect(brokerID, password, options, false)
+}
+
+// ConnectAsync returns a persistent peer before network setup completes. A
+// failed initial attempt can be retried on that same handle with Reconnect.
+func (c *Client) ConnectAsync(brokerID, password string, options ConnectOptions) (*Peer, error) {
+	return c.connect(brokerID, password, options, true)
+}
+
+func (c *Client) connect(brokerID, password string, options ConnectOptions, asynchronous bool) (*Peer, error) {
 	for label, value := range map[string]string{"broker ID": brokerID, "peer password": password, "STUN host": options.STUNHost} {
 		if err := text(label, value); err != nil {
 			return nil, err
@@ -341,7 +481,13 @@ func (c *Client) Connect(brokerID, password string, options ConnectOptions) (*Pe
 	cfg := C.ob_remote_connect_options{relay_mode: C.ob_remote_relay_mode(options.Relay), timeout_ms: C.uint32_t(options.Timeout.Milliseconds()), stun_server: stun, stun_port: C.uint16_t(options.STUNPort), max_maps: C.uint32_t(options.MaxMaps), max_flows: C.uint32_t(options.MaxFlows), udp_idle_timeout_ms: C.uint32_t(options.UDPIdleTimeout.Milliseconds())}
 	var ptr *C.ob_remote_peer
 	var diag C.ob_remote_error
-	if C.ob_remote_connect(api, broker, pw, &cfg, &ptr, &diag) != 0 {
+	var result C.int
+	if asynchronous {
+		result = C.ob_remote_connect_async(api, broker, pw, &cfg, &ptr, &diag)
+	} else {
+		result = C.ob_remote_connect(api, broker, pw, &cfg, &ptr, &diag)
+	}
+	if result != 0 {
 		return nil, peerError(&diag)
 	}
 	ok = true
@@ -359,6 +505,53 @@ func (p *Peer) Status() error {
 	}
 	return nil
 }
+
+// SetReconnectPolicy replaces the native policy. A zero policy restores defaults.
+func (p *Peer) SetReconnectPolicy(policy ReconnectPolicy) error {
+	cfg, err := nativeReconnectPolicy(policy)
+	if err != nil {
+		return err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.ptr == nil {
+		return errors.New("remote: peer closed")
+	}
+	var diagnostic C.ob_remote_error
+	if C.ob_remote_peer_set_reconnect_policy(p.ptr, &cfg, &diagnostic) != 0 {
+		return peerError(&diagnostic)
+	}
+	return nil
+}
+
+func (p *Peer) GetConnectionInfo() (ConnectionInfo, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.ptr == nil {
+		return ConnectionInfo{State: StateClosed}, errors.New("remote: peer closed")
+	}
+	var info C.ob_remote_connection_info
+	if result := C.ob_remote_peer_get_state(p.ptr, &info); result != 0 {
+		return ConnectionInfo{}, &Error{Code: int(result), Message: C.GoString(C.ob_remote_strerror(result))}
+	}
+	return connectionInfo(info), nil
+}
+
+// Reconnect is nonblocking: nil means accepted, not connected. Repeated calls
+// coalesce and preserve this peer, its mapping handles and local listening ports.
+func (p *Peer) Reconnect() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.ptr == nil {
+		return errors.New("remote: peer closed")
+	}
+	var diagnostic C.ob_remote_error
+	if C.ob_remote_peer_reconnect(p.ptr, &diagnostic) != 0 {
+		return peerError(&diagnostic)
+	}
+	return nil
+}
+
 func (p *Peer) Map(protocol Protocol, localHost string, localPort uint16, targetHost string, targetPort uint16) (*Mapping, error) {
 	if err := text("local host", localHost); err != nil {
 		return nil, err

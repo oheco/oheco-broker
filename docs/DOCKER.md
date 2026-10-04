@@ -1,6 +1,6 @@
 # Linux Docker 部署
 
-单一镜像 `ghcr.io/oheco/oheco-broker:0.3.0` 包含 `oheco-broker-server` 和完整 `oheco-broker` CLI，默认入口为独立服务端。使用 Linux Docker Engine 与 Compose v2；镜像发布提供 Linux amd64／arm64，HarmonyOS 发行包与 Linux 容器使用不同产物。本文命令从完整 checkout 的根目录执行，域名、IPv4 和私有路径由部署者填写。
+单一镜像 `ghcr.io/oheco/oheco-broker:0.4.0` 包含 `oheco-broker-server` 和完整 `oheco-broker` CLI，默认入口为独立服务端。使用 Linux Docker Engine 与 Compose v2；镜像发布提供 Linux amd64／arm64，HarmonyOS 发行包与 Linux 容器使用不同产物。本文命令从完整 checkout 的根目录执行，域名、IPv4 和私有路径由部署者填写。
 
 ## 两种 TLS 模式
 
@@ -199,7 +199,7 @@ docker run -d --name oheco-broker-static --restart unless-stopped \
   --mount "type=bind,src=$BROKER_DATA_DIR,dst=/var/lib/oheco-broker" \
   --mount "type=bind,src=$BROKER_SECRETS_DIR,dst=/run/oheco-broker/secrets,readonly" \
   --mount "type=bind,src=$BROKER_CERT_DIR,dst=/run/oheco-broker/tls,readonly" \
-  ghcr.io/oheco/oheco-broker:0.3.0 \
+  ghcr.io/oheco/oheco-broker:0.4.0 \
   --listen=0.0.0.0:443 --db=/var/lib/oheco-broker/db/control.sqlite \
   --admin-token-file=/run/oheco-broker/secrets/admin.token \
   --registration=approval --registration-relay=false \
@@ -245,7 +245,7 @@ docker run --rm --network host --user 10001:10001 --read-only \
   -e XDG_CONFIG_HOME=/var/lib/oheco-broker/config \
   --mount "type=bind,src=$BROKER_DATA_DIR,dst=/var/lib/oheco-broker" \
   --mount "type=bind,src=$BROKER_SECRETS_DIR,dst=/run/oheco-broker/secrets,readonly" \
-  --entrypoint /usr/local/bin/oheco-broker ghcr.io/oheco/oheco-broker:0.3.0 \
+  --entrypoint /usr/local/bin/oheco-broker ghcr.io/oheco/oheco-broker:0.4.0 \
   --api "https://$BROKER_DOMAIN:3478" \
   admin --token-file /run/oheco-broker/secrets/admin.token registration show
 ```
@@ -264,16 +264,18 @@ docker compose --env-file deploy/docker/.env.static \
 
 ## 镜像、资源与更新
 
-环境模板默认固定 `0.3.0` 标签，可用 `BROKER_IMAGE` 指定已验证的 digest 或本地镜像。服务配置由 Compose `command` 中的独立服务端 flags 提供；`OHECO_BROKER_ADMIN_TOKEN` 是 token 的环境备选来源，但例子使用私有文件，避免 token 出现在环境、命令行或渲染配置里。完整 flags 可直接查看：
+环境模板默认固定 `0.4.0` 标签，可用 `BROKER_IMAGE` 指定已验证的 digest 或本地镜像。服务配置由 Compose `command` 中的独立服务端 flags 提供；`OHECO_BROKER_ADMIN_TOKEN` 是 token 的环境备选来源，但例子使用私有文件，避免 token 出现在环境、命令行或渲染配置里。完整 flags 可直接查看：
 
 ```sh
-docker run --rm ghcr.io/oheco/oheco-broker:0.3.0 --help
-docker run --rm ghcr.io/oheco/oheco-broker:0.3.0 --version
+docker run --rm ghcr.io/oheco/oheco-broker:0.4.0 --help
+docker run --rm ghcr.io/oheco/oheco-broker:0.4.0 --version
 docker run --rm --entrypoint /usr/local/bin/oheco-broker \
-  ghcr.io/oheco/oheco-broker:0.3.0 --help
+  ghcr.io/oheco/oheco-broker:0.4.0 --help
 
 # 从完整 checkout 构建当前主机架构的镜像。
-docker build -t oheco-broker:0.3.0 .
+docker build -t oheco-broker:0.4.0 \
+  --build-arg APP_VERSION=0.4.0 \
+  --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" .
 ```
 
 镜像构建使用仓库中固定的 Go vendor 和 C SDK 依赖；首次拉取基础镜像、构建工具及系统包需要网络。应用 MIT，镜像的项目与依赖许可证位于 `/usr/share/licenses/oheco-broker/`，系统包版权记录位于 `/usr/share/doc/`。libjuice 及其他依赖保留各自许可证和源码义务，见[依赖记录](NATIVE-DEPENDENCIES.md)与[根许可证](../LICENSE)。完整 CLI 包含 C peer 引擎；默认独立服务端不链接该引擎。
@@ -286,18 +288,22 @@ Compose 示例给出 1 CPU、512 MiB 内存、128 个进程上限和每个服务
 
 ## 维护者构建与发布
 
-[Docker 工作流](../.github/workflows/docker.yml)在两种原生 Linux runner 上分别构建和验收，随后加载原样保存的已验收镜像发布 GHCR，多架构索引不重新构建应用。PR 执行构建验收；新 `v*` 标签自动发布；手动触发的 `version` 始终选择既有应用标签 `vVERSION`，构建配方取所触发的工作流提交，并分别记录 revision。
+[Docker 工作流](../.github/workflows/docker.yml)在两种原生 Linux runner 上分别构建和验收，随后加载原样保存的已验收镜像发布 GHCR，多架构索引不重新构建应用。PR 执行构建验收；新 `v*` 标签自动发布；手动触发的 `version` 通常选择既有应用标签 `vVERSION`；发布前可指定完整 40 位 `source_revision` 并保持 `publish=false`、`verify_only=false`，验证该提交而不创建标签或发布镜像。构建配方取所触发的工作流提交，并分别记录 revision。
 
-可选 `image_tag` 留空时使用应用版本，只允许显式指定同一应用版本或 `VERSION-docker.N`（`N` 为正整数）。例如维护容器配方时选择 `0.3.0-docker.1`，源码仍取不可变的 `v0.3.0`，两种程序的版本及 OCI 应用版本标签仍为 `0.3.0`。镜像已有版本／修订标签拒绝覆盖；不移动应用 Git 标签，也不替换已发布的 `0.3.0` 镜像。匿名验证同样接受 `image_tag`，拉取所选镜像标签并核对原应用版本／源码 revision。
+可选 `image_tag` 留空时使用应用版本，只允许显式指定同一应用版本或 `VERSION-docker.N`（`N` 为正整数）。例如维护容器配方时选择 `0.4.0-docker.1`，源码仍取不可变的 `v0.4.0`，两种程序的版本及 OCI 应用版本标签仍为 `0.4.0`。镜像已有版本／修订标签拒绝覆盖；不移动应用 Git 标签，也不替换已发布的 `0.3.0` 镜像。匿名验证同样接受 `image_tag`，拉取所选镜像标签并核对原应用版本／源码 revision。
 
 ```sh
+# 发布前验证当前提交，不创建标签或上传镜像。
+gh workflow run docker.yml --repo oheco/oheco-broker --ref main \
+  -f version=0.4.0 -f source_revision="$(git rev-parse HEAD)" -F publish=false
+
 # 未来配方修订示例；默认 publish=false，两种架构必须全部通过才发布。
 gh workflow run docker.yml --repo oheco/oheco-broker --ref main \
-  -f version=0.3.0 -f image_tag=0.3.0-docker.1 -F publish=true
+  -f version=0.4.0 -f image_tag=0.4.0-docker.1 -F publish=true
 
 # 验证现有镜像的匿名拉取和两架构实际执行，不重建或覆盖镜像。
 gh workflow run docker.yml --repo oheco/oheco-broker --ref main \
-  -f version=0.3.0 -F verify_only=true
+  -f version=0.4.0 -F verify_only=true
 ```
 
 GitHub 首次创建 GHCR 包默认私有，仓库本身公开不会自动改变包可见性。包管理员需在[包设置](https://github.com/orgs/oheco/packages/container/oheco-broker/settings)的 **Change visibility → Public** 完成一次公开设置，然后运行上面的匿名验证。发布凭据使用 Actions `GITHUB_TOKEN` 的 `packages: write`，不需要 Docker Hub 密码；匿名验证使用空 Docker 凭据目录。GitHub 目前[通过包设置网页管理可见性](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility#configuring-visibility-of-packages-for-an-organization)，REST API 不提供此修改接口。

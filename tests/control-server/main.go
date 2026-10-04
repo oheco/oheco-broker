@@ -3,6 +3,8 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
+	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -52,7 +55,53 @@ func main() {
 	_ = json.NewEncoder(os.Stdout).Encode(info)
 	gate.next = service.Handler()
 	defer gate.release()
-	server := &http.Server{Handler: gate, ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 10 * time.Second, MaxHeaderBytes: 16384}
+	// Recovery tests need nonsecret logical IDs for explicit revocation, while
+	// the public C peer API deliberately keeps transport credentials private.
+	// This route exists only in the disposable fixture and requires its admin.
+	inspection, err := sql.Open("sqlite3", *db)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	inspection.SetMaxOpenConns(1)
+	defer inspection.Close()
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/__test/connections" {
+			gate.ServeHTTP(w, r)
+			return
+		}
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")), []byte(token)) != 1 {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		rows, e := inspection.QueryContext(r.Context(), "SELECT id,generation,current_session_id,revoked_reason FROM connections WHERE broker_id=? ORDER BY created_at,id LIMIT 129", r.URL.Query().Get("broker_id"))
+		if e != nil {
+			http.Error(w, "fixture inspection failed", 500)
+			return
+		}
+		defer rows.Close()
+		out := make([]map[string]any, 0)
+		for rows.Next() {
+			var id, sid, revoked string
+			var generation uint64
+			if e = rows.Scan(&id, &generation, &sid, &revoked); e != nil {
+				http.Error(w, "fixture scan failed", 500)
+				return
+			}
+			out = append(out, map[string]any{"connection_id": id, "generation": generation, "session_id": sid, "revoked": revoked != ""})
+		}
+		if e = rows.Err(); e != nil {
+			http.Error(w, "fixture read failed", 500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"connections": out})
+	})
+	server := &http.Server{Handler: handler, ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 10 * time.Second, MaxHeaderBytes: 16384}
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

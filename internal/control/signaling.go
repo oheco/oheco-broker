@@ -176,6 +176,9 @@ func (s *Server) deleteBroker(w http.ResponseWriter, r *http.Request) error {
 	if e = txPrincipal(tx, r, p); e != nil {
 		return e
 	}
+	if e = revokeConnections(tx, "broker_id=?", "broker_deleted", b.ID); e != nil {
+		return e
+	}
 	if _, e = tx.Exec("DELETE FROM tokens WHERE broker_id=?", b.ID); e != nil {
 		return e
 	}
@@ -211,6 +214,9 @@ func (s *Server) rotateDevice(w http.ResponseWriter, r *http.Request) error {
 	}
 	if currentLease > now() {
 		return fail(409, "broker is online; wait for lease expiry or send offline")
+	}
+	if e = revokeConnections(tx, "broker_id=?", "broker_revoked", b.ID); e != nil {
+		return e
 	}
 	if _, e = tx.Exec("DELETE FROM tokens WHERE kind='session' AND broker_id=?", b.ID); e != nil {
 		return e
@@ -296,6 +302,9 @@ func (s *Server) offlineBroker(w http.ResponseWriter, r *http.Request) error {
 		return e
 	}
 	if _, e = tx.Exec("UPDATE brokers SET lease_expires_at=0 WHERE id=?", b.ID); e != nil {
+		return e
+	}
+	if e = revokeConnections(tx, "broker_id=?", "broker_revoked", b.ID); e != nil {
 		return e
 	}
 	if _, e = tx.Exec("DELETE FROM tokens WHERE kind='session' AND broker_id=?", b.ID); e != nil {
@@ -432,6 +441,9 @@ func (s *Server) sessionPrincipal(r *http.Request) (principal, Session, string, 
 	if e != nil {
 		return p, v, "", e
 	}
+	if e = s.managedSession(v); e != nil {
+		return p, v, "", e
+	}
 	if v.TenantID != p.tenant || v.BrokerID != p.broker {
 		return p, v, "", fail(403, "session scope denied")
 	}
@@ -459,7 +471,12 @@ func (s *Server) sessionStatus(v Session) (map[string]any, error) {
 	if e != nil {
 		return nil, e
 	}
-	return map[string]any{"session_id": v.ID, "broker_id": v.BrokerID, "tenant_id": v.TenantID, "relay_mode": v.RelayMode, "peer_authenticated": v.PeerAuthenticated, "relay_approved": v.RelayApproved, "expires_at": v.ExpiresAt, "broker_lease_expires_at": b.LeaseExpiresAt, "lease_seconds": int(s.cfg.BrokerLease.Seconds()), "stun_address": s.AdvertisedTURNAddr(), "turn_address": s.AdvertisedTURNAddr(), "turn_credential_renewal": s.turnRenewalMode()}, nil
+	out := map[string]any{"session_id": v.ID, "broker_id": v.BrokerID, "tenant_id": v.TenantID, "relay_mode": v.RelayMode, "peer_authenticated": v.PeerAuthenticated, "relay_approved": v.RelayApproved, "expires_at": v.ExpiresAt, "broker_lease_expires_at": b.LeaseExpiresAt, "lease_seconds": int(s.cfg.BrokerLease.Seconds()), "stun_address": s.AdvertisedTURNAddr(), "turn_address": s.AdvertisedTURNAddr(), "turn_credential_renewal": s.turnRenewalMode()}
+	if v.ConnectionID != "" {
+		out["connection_id"] = v.ConnectionID
+		out["generation"] = v.Generation
+	}
+	return out, nil
 }
 func (s *Server) getSession(w http.ResponseWriter, r *http.Request) error {
 	_, v, _, e := s.sessionPrincipal(r)
@@ -485,6 +502,9 @@ func (s *Server) sessionHeartbeat(w http.ResponseWriter, r *http.Request) error 
 	}
 	defer tx.Rollback()
 	if e = txPrincipal(tx, r, p); e != nil {
+		return e
+	}
+	if e = txManagedSession(tx, v); e != nil {
 		return e
 	}
 	var lease int64
@@ -528,6 +548,13 @@ func (s *Server) sessionHeartbeat(w http.ResponseWriter, r *http.Request) error 
 	return nil
 }
 func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request) error {
+	if handled, e := s.deleteSessionLineage(r); handled || e != nil {
+		if e != nil {
+			return e
+		}
+		s.write(w, 200, map[string]bool{"deleted": true})
+		return nil
+	}
 	p, v, _, e := s.sessionPrincipal(r)
 	if e != nil {
 		return e

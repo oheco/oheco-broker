@@ -35,17 +35,53 @@ void ob_wake(ob_remote_peer *p)
 { if (p->wake[1] >= 0) { const unsigned char c = 1; (void)write(p->wake[1], &c, 1); } }
 void ob_peer_fail_locked(ob_remote_peer *p, int code, const char *message)
 {
+    if (p->recovery.info.state == OB_REMOTE_STATE_CLOSED) return;
     if (!p->result) {
         p->result = code;
         if (code != OB_REMOTE_EHTTP || p->error.code != OB_REMOTE_EHTTP)
             ob_error(&p->error, code, 0, message);
     }
-    atomic_store(&p->stop, 1); pthread_cond_broadcast(&p->cv); ob_wake(p);
+    atomic_store(&p->stop, 1); atomic_store(&p->attempt_stop, 1);
+    p->transport_available = 0;
+    ob_recovery_set_locked(&p->recovery, OB_REMOTE_STATE_FAILED, &p->error);
+    pthread_cond_broadcast(&p->cv); ob_wake(p);
 }
 void ob_peer_fail(ob_remote_peer *p, int code, const char *message)
 { pthread_mutex_lock(&p->mu); ob_peer_fail_locked(p, code, message); pthread_mutex_unlock(&p->mu); }
+void ob_peer_transport_fail_locked(ob_remote_peer *p, int code, const char *message)
+{
+    if (atomic_load(&p->stop)) return;
+    if (!p->managed) { ob_peer_fail_locked(p, code, message); return; }
+    if (!p->attempt_result) {
+        p->attempt_result = code;
+        ob_error(&p->attempt_error, code, 0, message);
+    }
+    p->ready = p->proof_ready = 0; p->transport_available = 0;
+    if (!p->recovery.outage_us) p->recovery.outage_us = ob_now_us();
+    if (p->ever_ready && !p->recovery_deadline_us)
+        p->recovery_deadline_us = ob_now_us() + (uint64_t)p->recovery.policy.flow_grace_ms * 1000;
+    atomic_store(&p->attempt_stop, 1);
+    ob_recovery_set_locked(&p->recovery, OB_REMOTE_STATE_RECONNECTING, &p->attempt_error);
+    pthread_cond_broadcast(&p->cv); ob_wake(p);
+}
+void ob_peer_transport_fail(ob_remote_peer *p, int code, const char *message)
+{ pthread_mutex_lock(&p->mu); ob_peer_transport_fail_locked(p, code, message); pthread_mutex_unlock(&p->mu); }
 void ob_peer_mark_ready(ob_remote_peer *p)
-{ p->proof_ready = p->ready = 1; pthread_cond_broadcast(&p->cv); }
+{
+    if (p->ready || atomic_load(&p->stop) || atomic_load(&p->attempt_stop)) return;
+    p->proof_ready = p->ready = 1;
+    ob_mapping_transport_ready(p, p->wire_version, p->resume_context_available);
+    if (atomic_load(&p->stop) || atomic_load(&p->attempt_stop)) return;
+    if (!p->resume_context_available && p->resume_key_set)
+        memcpy(p->resume_key, p->fresh_resume_key, sizeof(p->resume_key));
+    if (!p->ever_ready) { p->recovery.info.attempts = 0; p->recovery.outage_us = 0; }
+    p->ever_ready = 1; p->recovery_deadline_us = 0;
+    atomic_store(&p->recovery.requested, 0);
+    p->recovery.stable_us = ob_now_us();
+    p->recovery.retry_us = 0;
+    ob_recovery_set_locked(&p->recovery, OB_REMOTE_STATE_CONNECTED, NULL);
+    pthread_cond_broadcast(&p->cv);
+}
 int ob_valid_id(const char *s)
 {
     if (!s || strlen(s) != 36) return 0;
@@ -70,6 +106,8 @@ ob_remote_peer *ob_peer_alloc(ob_api_client *api, const char *broker_id,
     pthread_once(&native_once, native_initialize);
     ob_remote_peer *p = calloc(1, sizeof(*p)); if (!p) return NULL;
     p->api = api; p->wake[0] = p->wake[1] = -1;
+    ob_recovery_init(&p->recovery);
+    p->managed = 1; p->transport_detached = 1; p->wire_version = 1;
     pthread_mutex_init(&p->mu, NULL); pthread_mutex_init(&p->qmu, NULL); pthread_cond_init(&p->cv, NULL);
     p->broker_id = strdup(broker_id); p->password = strdup(password);
     if (o && o->stun_server) p->stun = strdup(o->stun_server);
@@ -92,7 +130,9 @@ ob_remote_peer *ob_peer_alloc(ob_api_client *api, const char *broker_id,
 void ob_peer_destroy(ob_remote_peer *p)
 {
     if (!p) return;
-    atomic_store(&p->stop, 1); ob_wake(p);
+    atomic_store(&p->stop, 1); atomic_store(&p->attempt_stop, 1); ob_wake(p);
+    pthread_mutex_lock(&p->mu); pthread_cond_broadcast(&p->cv); pthread_mutex_unlock(&p->mu);
+    if (p->coordinator_started) pthread_join(p->coordinator_thread, NULL);
     if (p->setup_started) pthread_join(p->setup_thread, NULL);
     if (p->io_started) pthread_join(p->io_thread, NULL);
     if (p->ice) juice_destroy(p->ice);
@@ -102,12 +142,12 @@ void ob_peer_destroy(ob_remote_peer *p)
     ob_certificate_cleanup(p);
     if (p->password) { OPENSSL_cleanse(p->password, strlen(p->password)); free(p->password); }
     if (p->bearer) { OPENSSL_cleanse(p->bearer, strlen(p->bearer)); free(p->bearer); }
-    free(p->session_id); free(p->broker_id); free(p->stun);
+    free(p->session_id); free(p->pending_session_id); free(p->broker_id); free(p->stun);
     for (int i = 0; i < 2; ++i) if (p->wake[i] >= 0) close(p->wake[i]);
     pthread_cond_destroy(&p->cv); pthread_mutex_destroy(&p->mu); pthread_mutex_destroy(&p->qmu);
     OPENSSL_cleanse(p, sizeof(*p)); free(p);
 }
-int ob_remote_connect(ob_api_client *api, const char *broker_id, const char *password,
+int ob_remote_connect_async(ob_api_client *api, const char *broker_id, const char *password,
                       const ob_remote_connect_options *options, ob_remote_peer **out, ob_remote_error *error)
 {
     if (out) *out = NULL;
@@ -118,30 +158,27 @@ int ob_remote_connect(ob_api_client *api, const char *broker_id, const char *pas
         return ob_error(error, OB_REMOTE_EINVAL, 0, NULL);
     ob_remote_peer *p = ob_peer_alloc(api, broker_id, password, options);
     if (!p) return ob_error(error, OB_REMOTE_ENOMEM, 0, NULL);
-    cJSON *body = cJSON_CreateObject(), *response = NULL;
-    cJSON_AddStringToObject(body, "broker_id", broker_id);
-    cJSON_AddStringToObject(body, "relay_mode", p->relay == OB_REMOTE_RELAY_FORCE ? "force"
-        : p->relay == OB_REMOTE_RELAY_NEVER ? "never" : "auto");
-    int rc = ob_control_request(api, "POST", "/v1/sessions", NULL, body, &response, error); cJSON_Delete(body);
-    const char *sid = str(response, "session_id"), *token = str(response, "session_token");
-    if (!rc && (!ob_valid_id(sid) || !token)) rc = ob_error(error, OB_REMOTE_EPROTOCOL, 0, "Invalid control session response");
-    if (!rc) { p->session_id = strdup(sid); p->bearer = strdup(token);
-        if (!p->session_id || !p->bearer) rc = ob_error(error, OB_REMOTE_ENOMEM, 0, NULL); }
-    cJSON_Delete(response);
-    if (!rc && pthread_create(&p->setup_thread, NULL, ob_setup_worker, p))
-        rc = ob_error(error, OB_REMOTE_EIO, 0, "Cannot start peer setup worker");
+    int rc = ob_peer_start(p, error);
     if (rc) { ob_peer_destroy(p); return rc; }
-    p->setup_started = 1;
+    *out = p; return ob_error(error, 0, 0, NULL);
+}
+int ob_remote_connect(ob_api_client *api, const char *broker_id, const char *password,
+                       const ob_remote_connect_options *options, ob_remote_peer **out, ob_remote_error *error)
+{
+    if (out) *out = NULL;
+    if (!out) return ob_error(error, OB_REMOTE_EINVAL, 0, NULL);
+    uint64_t until = ob_now_us() + (uint64_t)def(options ? options->timeout_ms : 0, 30000) * 1000;
+    ob_remote_peer *p = NULL;
+    int rc = ob_remote_connect_async(api, broker_id, password, options, &p, error);
+    if (rc) return rc;
     pthread_mutex_lock(&p->mu);
     while (!p->ready && !p->result) {
-        uint64_t now = ob_now_us();
-        if (now >= p->deadline_us) { ob_peer_fail_locked(p, OB_REMOTE_ETIMEOUT, "Peer setup timed out"); break; }
+        if (ob_now_us() >= until) { ob_peer_fail_locked(p, OB_REMOTE_ETIMEOUT, "Peer setup timed out"); break; }
         struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += 100000000;
         if (ts.tv_nsec >= 1000000000) { ++ts.tv_sec; ts.tv_nsec -= 1000000000; }
         pthread_cond_timedwait(&p->cv, &p->mu, &ts);
     }
-    rc = p->result;
-    if (rc && error) *error = p->error;
+    rc = p->result; if (rc && error) *error = p->error;
     pthread_mutex_unlock(&p->mu);
     if (rc) { ob_peer_destroy(p); return rc; }
     *out = p; return ob_error(error, 0, 0, NULL);
@@ -157,6 +194,9 @@ void ob_remote_peer_close(ob_remote_peer *p)
 {
     if (!p) return;
     ob_peer_fail(p, OB_REMOTE_ECLOSED, "Peer closed by caller");
+    pthread_mutex_lock(&p->mu);
+    ob_recovery_set_locked(&p->recovery, OB_REMOTE_STATE_CLOSED, &p->error);
+    pthread_mutex_unlock(&p->mu);
     ob_peer_destroy(p);
 }
 static void server_free(ob_remote_server *s)
@@ -181,6 +221,7 @@ int ob_remote_serve(ob_api_client *api, const char *name, const char *password,
     if (!s) return ob_error(error, OB_REMOTE_ENOMEM, 0, NULL);
     pthread_mutex_init(&s->mu, NULL); pthread_cond_init(&s->cv, NULL);
     s->api = api; s->password = strdup(password);
+    ob_recovery_init(&s->recovery);
     if (o) s->options = *o;
     s->options.max_peers = def(s->options.max_peers, 16);
     s->options.setup_timeout_ms = def(s->options.setup_timeout_ms, 30000);
@@ -261,6 +302,9 @@ void ob_remote_server_close(ob_remote_server *s)
 {
     if (!s) return;
     atomic_store(&s->caller_close, 1); atomic_store(&s->stop, 1);
+    pthread_mutex_lock(&s->mu);
+    ob_recovery_set_locked(&s->recovery, OB_REMOTE_STATE_CLOSED, NULL);
+    pthread_cond_broadcast(&s->cv); pthread_mutex_unlock(&s->mu);
     if (s->worker_started) pthread_join(s->worker, NULL);
     ob_remote_peer *p = s->peers;
     while (p) { ob_remote_peer *next = p->next; ob_peer_destroy(p); p = next; }

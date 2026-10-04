@@ -54,12 +54,16 @@ static void pause_ms(unsigned ms)
 { struct timespec ts = {(time_t)(ms/1000), (long)(ms%1000)*1000000}; while (nanosleep(&ts, &ts) && errno == EINTR) {} }
 static int alive(ob_remote_peer *p)
 {
-    if (atomic_load(&p->stop)) return 0;
+    if (atomic_load(&p->stop) || atomic_load(&p->attempt_stop)) return 0;
     pthread_mutex_lock(&p->mu);
     int ready = p->ready, expired = p->lease_deadline_set && ob_now_us() >= p->lease_deadline_us;
     pthread_mutex_unlock(&p->mu);
-    if (expired) { ob_peer_fail(p, OB_REMOTE_ECLOSED, "Control authorization lease expired"); return 0; }
-    if (!ready && ob_now_us() >= p->deadline_us) { ob_peer_fail(p, OB_REMOTE_ETIMEOUT, "Peer setup timed out"); return 0; }
+    if (expired) {
+        if (p->control_managed) ob_peer_transport_fail(p, OB_REMOTE_ECLOSED, "Control authorization lease expired");
+        else ob_peer_fail(p, OB_REMOTE_ECLOSED, "Control authorization lease expired");
+        return 0;
+    }
+    if (!ready && ob_now_us() >= p->deadline_us) { ob_peer_transport_fail(p, OB_REMOTE_ETIMEOUT, "Peer setup timed out"); return 0; }
     return 1;
 }
 static uint64_t expiry(const char *text)
@@ -225,7 +229,9 @@ static int pake(ob_remote_peer *p)
     if (!rc && strcmp(remote, "ob-peer-v1 key confirmation")) rc = OB_REMOTE_EAUTH;
 end:
     free(remote); SPAKE2_CTX_free(ctx); OPENSSL_cleanse(mine, sizeof(mine));
-    if (p->password) { OPENSSL_cleanse(p->password, strlen(p->password)); free(p->password); p->password = NULL; }
+    /* Fresh transport attempts repeat PAKE. The owned password is retained in
+     * memory only and cleansed with all recovery keys on logical handle close. */
+    if (!rc && ob_resume_key_derive(p)) rc = OB_REMOTE_EAUTH;
     return rc;
 }
 static int turn_config(cJSON *response, juice_turn_server_t *turn, char host[256])
@@ -336,6 +342,14 @@ static int establish_ice(ob_remote_peer *p)
     const char *sdp = local;
     if (p->relay == OB_REMOTE_RELAY_FORCE) { if (ob_filter_relay_description(local, filtered)) return OB_REMOTE_EICE; sdp = filtered; }
     cJSON *body = cJSON_CreateObject(); cJSON_AddStringToObject(body, "sdp", sdp);
+    cJSON_AddNumberToObject(body, "mapping_version", 2);
+    if (p->resume_key_set) {
+        unsigned char proof[32]; char encoded[65];
+        if (ob_resume_proof(p, p->is_server, proof)) { cJSON_Delete(body); return OB_REMOTE_EAUTH; }
+        ob_hex(proof, sizeof(proof), encoded);
+        cJSON_AddStringToObject(body, "resume_proof", encoded);
+        OPENSSL_cleanse(proof, sizeof(proof));
+    }
     if (p->is_server) { char fp[65]; ob_hex(p->fingerprint, 32, fp); cJSON_AddStringToObject(body, "cert_sha256", fp); }
     char *payload = cJSON_PrintUnformatted(body); cJSON_Delete(body);
     if (!payload) return OB_REMOTE_ENOMEM;
@@ -343,6 +357,19 @@ static int establish_ice(ob_remote_peer *p)
     char *remote = NULL; rc = receive_signal(p, "ice", 1, &remote); if (rc) return rc;
     cJSON *remote_json = ob_peer_json_parse(remote); free(remote);
     const char *remote_sdp = string(remote_json, "sdp");
+    cJSON *version = cJSON_GetObjectItemCaseSensitive(remote_json, "mapping_version");
+    if (version && (!cJSON_IsNumber(version) ||
+        (version->valuedouble != 1 && version->valuedouble != 2))) rc = OB_REMOTE_EPROTOCOL;
+    p->wire_version = version && cJSON_IsNumber(version) && version->valuedouble == 2 ? 2 : 1;
+    p->resume_context_available = 0;
+    if (!rc && p->wire_version == 2 && p->resume_key_set) {
+        unsigned char expected[32], received[32];
+        if (!ob_resume_proof(p, !p->is_server, expected) &&
+            !ob_unhex(string(remote_json, "resume_proof"), received, sizeof(received)) &&
+            CRYPTO_memcmp(expected, received, sizeof(expected)) == 0)
+            p->resume_context_available = p->ever_ready;
+        OPENSSL_cleanse(expected, sizeof(expected)); OPENSSL_cleanse(received, sizeof(received));
+    }
     if (!remote_sdp || strlen(remote_sdp) >= JUICE_MAX_SDP_STRING_LEN) rc = OB_REMOTE_EPROTOCOL;
     if (!rc && !p->is_server && ob_unhex(string(remote_json, "cert_sha256"), p->fingerprint, 32)) rc = OB_REMOTE_EAUTH;
     if (!rc && p->relay == OB_REMOTE_RELAY_FORCE) {
@@ -356,8 +383,15 @@ static int establish_ice(ob_remote_peer *p)
     juice_set_remote_gathering_done(p->ice);
     while (alive(p) && !atomic_load(&p->ice_ready) && !atomic_load(&p->ice_failed)) { rc = peer_tick(p, 10); if (rc) return rc; }
     if (!atomic_load(&p->ice_ready) || atomic_load(&p->ice_failed)) return OB_REMOTE_EICE;
-    if (pthread_create(&p->io_thread, NULL, ob_engine_worker, p)) return OB_REMOTE_EIO;
-    p->io_started = 1; return 0;
+    pthread_mutex_lock(&p->mu);
+    if (!atomic_load(&p->stop) && !atomic_load(&p->attempt_stop)) {
+        p->transport_detached = 0; p->transport_available = 1;
+        pthread_cond_broadcast(&p->cv); ob_wake(p);
+    }
+    pthread_mutex_unlock(&p->mu);
+    /* The I/O owner was started with the logical handle and stays alive while
+     * transport attempts are suspended. */
+    return 0;
 }
 /* Close RPC is bounded and best-effort. REST is a single cleanup attempt only
  * if no usable WS exists; it is never a polling/recovery transport. */
@@ -390,6 +424,12 @@ static void cancel_session(ob_remote_peer *p)
         cleanup_rest(p->api, "DELETE", path, p->bearer);
     }
 }
+void ob_control_close_connection(ob_remote_peer *p)
+{
+    if (!p->control_managed || !ob_valid_id(p->connection_id)) return;
+    char path[128]; snprintf(path, sizeof(path), "/v1/connections/%s", p->connection_id);
+    cleanup_rest(p->api, "DELETE", path, p->is_server ? p->bearer : NULL);
+}
 void *ob_setup_worker(void *data)
 {
     ob_remote_peer *p = data;
@@ -397,7 +437,14 @@ void *ob_setup_worker(void *data)
     int rc = p->ws ? capabilities(p, 0) : OB_REMOTE_ENOMEM;
     if (!rc) rc = pake(p);
     if (!rc && alive(p)) rc = establish_ice(p);
-    if (rc) ob_peer_fail(p, rc, ob_remote_strerror(rc));
+    if (rc && !atomic_load(&p->stop) && !atomic_load(&p->attempt_stop)) {
+        /* Cancellation after a transient failure/replacement retires only this
+         * attempt. Its ECLOSED result must not terminate the logical peer. */
+        if (rc == OB_REMOTE_EICE || rc == OB_REMOTE_EQUIC || rc == OB_REMOTE_ETIMEOUT ||
+            rc == OB_REMOTE_EIO || (rc == OB_REMOTE_EHTTP && p->control_managed))
+            ob_peer_transport_fail(p, rc, ob_remote_strerror(rc));
+        else ob_peer_fail(p, rc, ob_remote_strerror(rc));
+    }
     while (alive(p)) {
         rc = peer_tick(p, 50); if (rc) break;
         /* After ICE, only already-consumed replay is legal. Future unexpected
@@ -410,6 +457,7 @@ void *ob_setup_worker(void *data)
             if (unexpected) { ob_peer_fail(p, OB_REMOTE_EPROTOCOL, "Unexpected post-setup signal"); break; }
         }
     }
-    cancel_session(p); ob_ws_destroy(p->ws); p->ws = NULL; return NULL;
+    if (atomic_load(&p->stop) && !p->control_managed) cancel_session(p);
+    ob_ws_destroy(p->ws); p->ws = NULL; return NULL;
 }
 #include "ws_server.inc"

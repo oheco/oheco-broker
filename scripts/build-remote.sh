@@ -17,7 +17,7 @@ cmake=${CMAKE:-cmake}
     -DOB_CXX_RUNTIME="$OB_CXX_RUNTIME" -DOB_REMOTE_BUILD_TESTS=ON \
     -DOB_REMOTE_TEST_SOURCE_DIR="$root/tests/c"
 "$cmake" --build "$build" --parallel "${NATIVE_JOBS:-4}"
-for name in remote_peer_test websocket_test; do
+for name in remote_peer_test websocket_test recovery_peer_test udp_fault_preload.so; do
     binary="$build/$name"
     if [ "$(go env GOOS)" = ohos ]; then
         binary-sign-tool sign -inFile "$binary" -outFile "$binary.signed" -selfSign 1 >/dev/null
@@ -31,7 +31,9 @@ import pathlib, shlex, sys
 build = pathlib.Path(sys.argv[1])
 with (build/'remote.env').open('a') as env:
     for key, value in {'GOFLAGS':'-mod=vendor', 'OB_REMOTE_TEST':str(build/'remote_peer_test.signed'),
-                       'OB_WS_TEST':str(build/'websocket_test.signed')}.items():
+                       'OB_WS_TEST':str(build/'websocket_test.signed'),
+                       'OB_RECOVERY_TEST':str(build/'recovery_peer_test.signed'),
+                       'OB_UDP_FAULT_PRELOAD':str(build/'udp_fault_preload.so.signed')}.items():
         env.write('export '+key+'='+shlex.quote(value)+'\n')
 PY
 printf 'Built full-checkout tests; source %s/remote.env for Go/cgo builds.\n' "$build"

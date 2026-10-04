@@ -63,6 +63,64 @@ typedef struct {
     uint32_t max_flows;               /* zero defaults to 128 */
     uint32_t udp_idle_timeout_ms;     /* zero defaults to 60000 */
 } ob_remote_connect_options;
+/* Connection handles and local mapping ports survive recoverable transport
+ * failures. State callbacks are optional, run without SDK locks, and must not
+ * close/destroy their handle; enqueue that action on the caller's thread.
+ * Explicit close must still be serialized with all calls on the same handle. */
+typedef enum {
+    OB_REMOTE_STATE_CONNECTING = 0,
+    OB_REMOTE_STATE_CONNECTED = 1,
+    OB_REMOTE_STATE_RECONNECTING = 2,
+    OB_REMOTE_STATE_RETRY_WAIT = 3,
+    OB_REMOTE_STATE_PAUSED = 4,
+    OB_REMOTE_STATE_FAILED = 5,
+    OB_REMOTE_STATE_CLOSED = 6
+} ob_remote_connection_state;
+typedef struct {
+    uint32_t struct_size;            /* sizeof(ob_remote_reconnect_policy) */
+    uint32_t disabled;               /* zero enables automatic recovery */
+    uint32_t max_attempts;           /* zero defaults to 8 */
+    uint32_t initial_delay_ms;       /* zero defaults to 1000 */
+    uint32_t max_delay_ms;           /* zero defaults to 15000 */
+    uint32_t retry_budget_ms;        /* zero defaults to 60000 */
+    uint32_t flow_grace_ms;          /* zero defaults to 120000 */
+    uint32_t stable_reset_ms;        /* zero defaults to 30000 */
+    uint32_t transport_timeout_ms;   /* v2 loss detection; zero defaults to 15000 */
+} ob_remote_reconnect_policy;
+typedef struct {
+    ob_remote_connection_state state;
+    uint32_t attempts;
+    uint64_t generation;
+    uint64_t next_retry_ms;          /* relative delay; zero if not waiting */
+    ob_remote_error last_error;
+} ob_remote_connection_info;
+typedef void (*ob_remote_state_callback)(const ob_remote_connection_info *info,
+                                         void *user_data);
+void ob_remote_reconnect_policy_init(ob_remote_reconnect_policy *policy);
+int ob_remote_peer_set_reconnect_policy(ob_remote_peer *peer,
+                         const ob_remote_reconnect_policy *policy,
+                         ob_remote_error *error);
+int ob_remote_server_set_reconnect_policy(ob_remote_server *server,
+                         const ob_remote_reconnect_policy *policy,
+                         ob_remote_error *error);
+int ob_remote_peer_get_state(ob_remote_peer *peer, ob_remote_connection_info *info);
+int ob_remote_server_get_state(ob_remote_server *server, ob_remote_connection_info *info);
+int ob_remote_peer_set_state_callback(ob_remote_peer *peer,
+                         ob_remote_state_callback callback, void *user_data);
+int ob_remote_server_set_state_callback(ob_remote_server *server,
+                         ob_remote_state_callback callback, void *user_data);
+/* Nonblocking: success means accepted, not connected. Repeated requests are
+ * coalesced. A connected handle is left intact. Authorization is revalidated;
+ * retrying cannot override an explicit revocation or authentication failure. */
+int ob_remote_peer_reconnect(ob_remote_peer *peer, ob_remote_error *error);
+int ob_remote_server_reconnect(ob_remote_server *server, ob_remote_error *error);
+/* Returns a live handle before network setup finishes, so an initial connection
+ * failure can also be retried manually. Invalid input/allocation still fails. */
+int ob_remote_connect_async(ob_api_client *api, const char *broker_id,
+                           const char *peer_password,
+                           const ob_remote_connect_options *options,
+                           ob_remote_peer **out, ob_remote_error *error);
+
 /* Copies password/options/rules. Registers broker and starts background
  * control and native I/O workers. Password is NEVER an HTTP credential/body.
  * Caller serializes close with other operations on the same handle. */

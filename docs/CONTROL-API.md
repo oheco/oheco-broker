@@ -1,6 +1,6 @@
 # Go/SQLite control-plane API (v1): REST management + WS/WSS signaling
 
-This is the 0.3.0 REST management and server authorization contract, separate from the local shell service and the peer wire protocol. The server embeds standalone Pion STUN/TURN, not WebRTC, and does not terminate native QUIC or receive peer passwords. Native C peers verify end-to-end authentication before the broker approves a session. See the [validation index](LOCAL-VALIDATION.md) for implementation and release evidence.
+This is the 0.4.0 REST management and server authorization contract, separate from the local shell service and the [peer wire protocol](<PEER-PROTOCOL.md>). API paths remain under `/v1`; managed connection recovery is an additive contract. The server embeds standalone Pion STUN/TURN, not WebRTC, and does not terminate native QUIC or receive peer passwords. Native C peers verify end-to-end authentication before the broker approves each new transport session. See the [recovery guide](<RECONNECT.md>) for SDK behavior and the [validation index](<LOCAL-VALIDATION.md>) for implementation and release evidence.
 
 ## Embedding / CLI adapter
 
@@ -50,7 +50,7 @@ All routes begin with `/v1`. JSON responses have `Cache-Control: no-store`. Requ
 
 Strict JSON rejects unknown fields, trailing values, malformed data and bodies over 64 KiB. Empty action endpoints may omit the body. The server never returns an account password, its hash, token digests or admin secret. Registration's server fallback creates an unpredictable password but **does not reveal it**; therefore a client that needs future login must generate and retain its own password. Random fallback email uses `example.invalid`, not a claim to email verification. There is no email delivery/recovery flow in v1.
 
-Error response: `{"error":"safe description"}`. Statuses: 400 invalid body/bounds; 401 missing/invalid/expired/revoked bearer; 403 scope/capability/status denial; 404 absent or foreign-tenant resource; 409 sequence/name/lease/state conflict; 410 expired session if its token still exists; 429 state/credential limit; 503 disabled TURN or closed server. Expired token may produce 401 instead of 410; cleaned expired session may produce 404. Existing REST management and signaling endpoints remain backward-compatible. **Native continuous signaling must use WS/WSS, not REST short-poll or an HTTP polling fallback.** See the [ob-signaling-v1 contract](<WS-SIGNALING.md>) for exact upgrade paths, request/result/push/ACK frames, recovery and lifecycle bounds.
+Error response: `{"error":"safe description"}`; managed lifecycle errors additionally carry `error_code` and, when known and nonzero, `generation`. Statuses: 400 invalid body/bounds; 401 missing/invalid/expired/revoked bearer; 403 scope/capability/status denial; 404 absent or foreign-tenant resource; 409 sequence/name/lease/state conflict; 410 expired session; 429 state/credential limit; 503 disabled TURN or closed server. Legacy session access can return 401 for an expired token or 404 after cleanup. Managed clients classify the typed lifecycle reason described below rather than treating every 410 as revocation. Existing REST management and legacy signaling endpoints retain their contract. **Native continuous signaling must use WS/WSS, not REST short-poll or an HTTP polling fallback.** See the [ob-signaling-v1 contract](<WS-SIGNALING.md>) for exact upgrade paths, request/result/push/ACK frames, recovery and lifecycle bounds.
 
 ### Public / account endpoints
 
@@ -94,7 +94,61 @@ Capability object includes `status`, `relay_enabled`, `turn_available`, `stun_ad
 
 Broker object: `{id,tenant_id,name,lease_expires_at,online,created_at}`. Device bearer is scoped to exactly one broker, has a one-year maximum token TTL and is invalidated by account/password changes, rotation or broker deletion. Lease expiration does not destroy that device identity: the same token can explicitly heartbeat to reconnect. Existing sessions remain subject to their independent expiry; offline explicitly deletes them. For process restarts, list the tenant's broker by unique name, refuse takeover while it is online, and rotate the offline broker's token instead of creating a new UUID. Heartbeat normally every 30 s for a 90 s lease. Every session operation checks current tenant status, token version, resource scope, session expiry and broker lease.
 
+### Managed logical connections and transport sessions
+
+A connection ID identifies a durable authorization lineage. A session ID identifies one replaceable transport attempt, with its own mailbox, bearer, approval and lease. A connection record alone grants no forwarding lease. Recovery requires both a newly authorized session and fresh end-to-end peer authentication.
+
+| Method | Route | Authorization / body / response |
+|---|---|---|
+| GET | `/status` | Public discovery → `{connection_recovery_version:1,connection_recovery_protocol:"connections-v1",signaling:"ob-signaling-v1"}` |
+| POST | `/connections/{id}/session` | Original account bearer; required body below → 201 new session or 200 identical request replay |
+| DELETE | `/connections/{id}` | Owning tenant account or the bound broker's device bearer → `{deleted:true}`; permanently revokes the lineage |
+
+The authenticated account capability object also advertises `connection_recovery_version:1`. A client discovers support before selecting this endpoint. An older server without this capability uses legacy `/sessions`; that fallback cannot promise retained target sockets across retries. An advertised but unsupported recovery contract must not be silently treated as legacy support.
+
+The caller generates and retains the logical connection UUID before the first request. Each distinct attempt uses a new request UUID and a cryptographically random 32-byte session token encoded as exactly 64 lowercase hexadecimal characters. The caller keeps that token locally; the backend stores only its digest and does not return the plaintext. Connection, broker and request IDs use lowercase UUID spelling with hyphens. Required request shape, with `session_token` shown as a placeholder:
+
+```json
+{
+  "broker_id":"22222222-2222-4222-8222-222222222222",
+  "relay_mode":"auto",
+  "expected_generation":0,
+  "request_id":"33333333-3333-4333-8333-333333333333",
+  "session_token":"<64 lowercase hex characters>"
+}
+```
+
+`relay_mode` must be `auto`, `never` or `force`; it has no omitted-field default on this endpoint. `expected_generation` is required and uses an unsigned JSON integer. Zero creates an unknown connection; later attempts compare it with the current committed generation. Generation starts at one and is bounded by 2147483647. A successful new attempt returns:
+
+```json
+{"session_id":"44444444-4444-4444-8444-444444444444","connection_id":"11111111-1111-4111-8111-111111111111","generation":1,"expires_at":"RFC3339"}
+```
+
+Creation, generation advancement, token insertion and replacement of the previous session commit atomically. The old transport token, session and mailbox are removed; the old socket is notified, and the broker receives the new snapshot. Managed snapshot/session-status objects add `connection_id` and `generation`; legacy objects omit them. The broker matches a newer generation to the same logical peer and retires its old transport before setup of the new session.
+
+If the response is lost, resend the **same** connection ID, broker, relay mode, request ID, token and prior `expected_generation`. An exact replay of the latest committed request returns 200 with the same SID, generation and expiry, without issuing a second grant or returning the token. Changing that replay gives 409 `connection_conflict`. Replaying a request whose session naturally expired gives 410 `session_expired` with the current generation; a new request/token at that generation can then advance the lineage. Reusing an older request ID/token still present in retained history, or supplying a stale generation, gives a conflict. The caller must generate fresh request IDs and tokens for distinct attempts. A lost reply is not permission to invent a new connection ID.
+
+Authorization remains bound to the **original account-token digest, broker-device-token digest, tenant UUID/version, broker UUID and relay mode**. Every attempt and managed session operation rechecks this binding. A fresh login or rotated device token does not authorize resurrection of an old lineage. Logout, identity/password changes, tenant disable, broker deletion/offline or device rotation, explicit connection/session deletion, and observed revocation of a still-live session credential terminate the applicable lineage. Merely deleting an expired transport row is recoverable. Once a still-live session-token revocation is observed, it is persisted before later expiry/cleanup can conceal it.
+
+Typed lifecycle errors have the same body on REST results and WS business results/pushes:
+
+| Status / `error_code` | Meaning and recovery behavior |
+|---|---|
+| 410 `session_expired` | Transport lease expired or its row was cleaned; park forwarding and obtain a fresh attempt under the still-authorized lineage. |
+| 409 `session_replaced` | A newer generation replaced this SID; retire the old attempt and use the current logical connection. |
+| 403 `connection_revoked` | Explicit closure or changed connection scope; terminal for this lineage. |
+| 403 `credential_revoked` | Original account/device/tenant identity or a live session credential lost authorization; terminal. |
+| 409 `connection_conflict` | Changed replay, stale generation, reused request/token or generation limit; reconcile the known generation without bypassing the identity binding. |
+| 409 `broker_offline` | Broker heartbeat is required; may retry within policy after the bound device restores its lease. |
+| 404 `connection_unknown` / `broker_missing` | Unknown lineage at a nonzero generation or absent broker; cannot recreate an old authorized connection implicitly. |
+
+For example: `{"error":"session lease expired","error_code":"session_expired","generation":3}`. A bare or unrelated 410 does not prove this recovery classification. For an already authenticated managed WebSocket, lineage authorization is checked before ordinary missing-token/SID errors, using its captured connection ID and retained SID history. Revocation therefore takes precedence over natural expiry, including after the active session row is deleted.
+
+Admission has separate bounds: each tenant may have at most `MaxSessionsPerTenant` unrevoked logical connections and at most that many live transport sessions. A replaced current session is excluded from the session count for its replacement. Revoked tombstones do not consume the tenant's active-connection quota; they do consume the global 10000-row connection storage bound. Live sessions also have a separate global limit of 10000. Old generation history is bounded to the current generation and up to 256 preceding generations; forgotten IDs fail closed. Tombstones persist while their original account/device identities and tenant version remain live, protecting a lost initial response from recreating a revoked ID. Cleanup removes lineages whose original authorization is no longer live. Quota admission denials return 429.
+
 ### Session signaling (native end-to-end transport)
+
+Managed clients first obtain a session using the endpoint above; then both managed and legacy sessions use the same scoped signaling operations. The legacy creation sequence remains:
 
 1. Caller authenticates to account and `POST /sessions {"broker_id":"uuid","relay_mode":"auto"}`. Response 201 `{session_id,session_token,expires_at}`. Modes: `auto`, `never`, `force` (default `auto`). Force is rejected unless TURN exists and tenant relay is enabled; peers must actually route only through relay in force mode.
 2. Broker connects `GET /ws/brokers/{id}` with its device bearer and subprotocol `ob-signaling-v1`; it receives an initial and event-driven `sessions` snapshot. The old `GET /brokers/{id}/sessions` route remains for existing REST clients only. Session entries: `{session_id,tenant_id,broker_id,relay_mode,peer_authenticated,relay_approved,expires_at}`.
@@ -105,7 +159,7 @@ Broker object: `{id,tenant_id,name,lease_expires_at,online,created_at}`. Device 
 7. Only then can **either** side `POST /sessions/{id}/turn` with scoped bearer receive independent temporary `{urls:["turn:host:port?transport=udp"],username,password,expires_at}`. Tenant capability, broker lease, session mode and approval must still permit relay. Credential identity is attributed server-side to immutable tenant/broker/session, without putting those identifiers into a reusable client-supplied claim.
 8. `GET /sessions/{id}` (alias `/capabilities`) returns flat status fields: `{session_id,tenant_id,broker_id,relay_mode,peer_authenticated,relay_approved,expires_at,broker_lease_expires_at,lease_seconds,stun_address,turn_address,turn_credential_renewal}`.
 9. `POST /sessions/{id}/heartbeat` using either scoped side bearer renews the session and caller token for `SessionTTL`, provided the broker lease remains live. It returns the same status and **does not renew broker lease**. The self-hosted provider advertises `turn_credential_renewal:"session-heartbeat"`: after committing the heartbeat, an approved live relay session also extends its **existing, unexpired** per-side TURN credentials to `min(new session expiry, now + MaxCredentialTTL)` with the **same username/password**. Existing allocations are not restarted, so a healthy forced-relay mapping does not disconnect at the original credential deadline. Renewal rechecks tenant capability, broker lease, session approval and quota; it cannot mint missing credentials or resurrect expired/revoked ones. If heartbeats cease, bounded credential timers still expire and close allocations; reconnect requires a new approved credential/allocation. Send heartbeat well before the shorter of session, broker and credential deadlines. TURN-disabled providers advertise `"none"`.
-10. `DELETE /sessions/{id}` by either side deletes caller token and messages, revokes credentials/allocations → `{deleted:true}`.
+10. `DELETE /sessions/{id}` by either side deletes caller token and messages, revokes credentials/allocations → `{deleted:true}`. For a managed session this explicitly revokes its whole logical connection, including retained history; it is not the operation used to retire a recoverable transport attempt.
 
 Both native peers must use explicit WS session heartbeats (push/ACK/ping/pong never renew leases) and fail closed if authorization is rejected or the control server is unavailable longer than the advertised lease. This is essential for already-established **direct** QUIC transport: the control server is not a data-plane middlebox and cannot forcibly intercept its packets. STUN candidate discovery must not leak native passwords. Current native PAKE integration uses the pinned BoringSSL SPAKE2 draft-02 suite, not an assertion of RFC 9382 wire compatibility; the server is protocol-opaque.
 
@@ -155,7 +209,9 @@ REST bounds: 128 brokers per tenant; 128 active sessions per tenant by default, 
 
 ## SQLite storage
 
-Schema version 1 uses UUID TEXT keys, UTC millisecond INTEGER times, integer booleans and parameterized statements. Tables retain tenants, hashed scoped tokens, brokers, sessions, directional messages, settings and daily/minute usage. `(session_id,side,sequence)` is unique; registration/token issuance, revocation, idempotent messages and usage commits are atomic. Never serialize password hashes or token hashes. This implementation uses SQLite; a Workers/D1 adapter is not provided.
+Schema version **2** uses UUID TEXT keys, UTC millisecond INTEGER times, integer booleans and parameterized statements. Existing tables retain tenants, hashed scoped tokens, brokers, sessions, directional messages, settings and daily/minute usage. `connections` adds the original authorization binding, current generation/SID, latest request, token digest and revocation tombstone. `connection_sessions` retains bounded SID/request/token history with unique `(connection_id,generation)` and `(connection_id,request_id)` pairs; its SID history intentionally survives deletion of the active `sessions` row. `(session_id,side,sequence)` remains unique for mailbox entries. Registration/token issuance, generation replacement, revocation, idempotent messages and usage commits are atomic. Plaintext bearer tokens and peer passwords are not persisted.
+
+Startup accepts schema 1 or 2. The schema-1 upgrade creates the new tables/indexes and changes the version to 2 in one transaction; it preserves existing legacy sessions and management data. Take a proper SQLite backup before migration. The previous schema-1 server refuses a schema-2 database; changing only the version field is not a supported downgrade. To roll back, restore a pre-upgrade backup under the older server and account for changes made since it was taken. Unknown schema versions are refused. This implementation uses SQLite; a Workers/D1 adapter is not provided.
 
 ## Pinned source inputs
 

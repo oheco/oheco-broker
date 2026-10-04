@@ -17,16 +17,16 @@ import tarfile
 import tempfile
 
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 RUNTIME_ROOT = f"oheco-broker-{VERSION}-ohos-arm64"
 SDK_ROOT = f"oheco-broker-{VERSION}-sdk-source"
 SOURCE_TREES = ("sdk/c", "sdk/go", "sdk/dotnet", "vendor", "vendor-manifests")
-SOURCE_FILES = {"LICENSE", "protocol/PROTOCOL.md", "go.mod", "go.sum"}
+SOURCE_FILES = {"LICENSE", "protocol/PROTOCOL.md", "docs/RECONNECT.md", "go.mod", "go.sum"}
 RUNTIME_METADATA = {"README.md", "BUILDINFO.txt", "RUNTIME.json", "LICENSES.json",
                     "THIRD-PARTY-NOTICES.txt", "SHA256SUMS"}
 RUNTIME_BINARIES = {"bin/oheco-broker", "bin/oheco-broker-server", "libexec/oheco-broker",
                     "lib/runtime/libc++_shared.so"}
-README = """# oheco-broker 0.3.0 source SDKs
+README = """# oheco-broker 0.4.0 source SDKs
 
 Download this source SDK attachment from the GitHub Release and extract it
 into an editable directory. The installed runtime package also includes SDK sources.
@@ -107,7 +107,7 @@ def parse_buildinfo(data):
             raise ValueError("Malformed runtime BUILDINFO entry")
         info[key] = value
     if info.get("version") != VERSION or not re.fullmatch(r"[0-9a-f]{40}", info.get("source_commit", "")):
-        raise ValueError("Runtime archive must identify formal 0.3.0 and a source commit")
+        raise ValueError("Runtime archive must identify formal 0.4.0 and a source commit")
     return info
 
 
@@ -253,7 +253,7 @@ def main():
         parser.error("TMPDIR must name an existing absolute private temporary directory")
     archive = args.runtime_archive.resolve()
     if not archive.is_file() or archive.name != RUNTIME_ROOT + ".tar.gz":
-        parser.error("Input must be the verified oheco-broker-0.3.0-ohos-arm64.tar.gz archive")
+        parser.error("Input must be the verified oheco-broker-0.4.0-ohos-arm64.tar.gz archive")
     result = derive(archive, (args.output_dir or archive.parent).resolve(), temporary)
     for key, value in result.items():
         print(f"{key}={value}")

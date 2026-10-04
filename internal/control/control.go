@@ -91,6 +91,8 @@ type Session struct {
 	PeerAuthenticated bool      `json:"peer_authenticated"`
 	RelayApproved     bool      `json:"relay_approved"`
 	ExpiresAt         time.Time `json:"expires_at"`
+	ConnectionID      string    `json:"connection_id,omitempty"`
+	Generation        uint64    `json:"generation,omitempty"`
 }
 type Message struct {
 	Sequence int64  `json:"sequence"`
@@ -98,12 +100,24 @@ type Message struct {
 }
 
 type apiError struct {
-	code    int
-	message string
+	code       int
+	message    string
+	reason     string
+	generation uint64
 }
 
 func (e *apiError) Error() string         { return e.message }
-func fail(code int, message string) error { return &apiError{code, message} }
+func fail(code int, message string) error { return &apiError{code: code, message: message} }
+func apiErrorBody(a *apiError) map[string]any {
+	body := map[string]any{"error": a.message}
+	if a.reason != "" {
+		body["error_code"] = a.reason
+	}
+	if a.generation != 0 {
+		body["generation"] = a.generation
+	}
+	return body
+}
 
 // New opens/migrates SQLite and optionally starts the embedded UDP TURN listener.
 // Handler can be mounted on the caller's HTTP server; ListenAddr is informational.
@@ -323,8 +337,25 @@ func (s *Server) migrate() error {
 	if err = s.db.QueryRow("SELECT version FROM schema_version").Scan(&v); err != nil {
 		return err
 	}
-	if v != 1 {
+	if v != 1 && v != 2 {
 		return fmt.Errorf("control: unsupported schema version %d", v)
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.Exec(`CREATE TABLE IF NOT EXISTS connections(id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,broker_id TEXT NOT NULL REFERENCES brokers(id) ON DELETE CASCADE,relay_mode TEXT NOT NULL,account_hash TEXT NOT NULL,device_hash TEXT NOT NULL,tenant_version INTEGER NOT NULL,generation INTEGER NOT NULL,current_session_id TEXT NOT NULL,request_id TEXT NOT NULL,prior_generation INTEGER NOT NULL,session_token_hash TEXT NOT NULL,revoked_reason TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+ CREATE INDEX IF NOT EXISTS connections_tenant ON connections(tenant_id);
+ CREATE INDEX IF NOT EXISTS connections_broker ON connections(broker_id);
+ CREATE TABLE IF NOT EXISTS connection_sessions(session_id TEXT PRIMARY KEY,connection_id TEXT NOT NULL REFERENCES connections(id) ON DELETE CASCADE,generation INTEGER NOT NULL,request_id TEXT NOT NULL,prior_generation INTEGER NOT NULL,token_hash TEXT NOT NULL UNIQUE,created_at INTEGER NOT NULL,UNIQUE(connection_id,generation),UNIQUE(connection_id,request_id));
+ CREATE INDEX IF NOT EXISTS connection_sessions_connection ON connection_sessions(connection_id,generation);
+ UPDATE schema_version SET version=2;`)
+	if err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return err
 	}
 	_, err = s.db.Exec("INSERT OR IGNORE INTO settings(key,value) VALUES('registration_policy',?),('registration_relay_enabled',?)", s.cfg.RegistrationPolicy, strconv.FormatBool(s.cfg.RegistrationRelayEnabled))
 	return err
@@ -346,9 +377,10 @@ func (s *Server) endpoint(fn func(http.ResponseWriter, *http.Request) error) htt
 		default:
 		}
 		if err := fn(w, r); err != nil {
+			err = s.persistObservedRevocation(err)
 			var a *apiError
 			if errors.As(err, &a) {
-				s.write(w, a.code, map[string]string{"error": a.message})
+				s.write(w, a.code, apiErrorBody(a))
 			} else {
 				s.write(w, 500, map[string]string{"error": "internal server error"})
 			}
@@ -405,7 +437,7 @@ func (s *Server) session(id string) (Session, error) {
 	var v Session
 	var peer, relay int
 	var expiry int64
-	e := s.db.QueryRow("SELECT id,tenant_id,broker_id,relay_mode,peer_authenticated,relay_approved,expires_at FROM sessions WHERE id=?", id).Scan(&v.ID, &v.TenantID, &v.BrokerID, &v.RelayMode, &peer, &relay, &expiry)
+	e := s.db.QueryRow("SELECT s.id,s.tenant_id,s.broker_id,s.relay_mode,s.peer_authenticated,s.relay_approved,s.expires_at,COALESCE(c.connection_id,''),COALESCE(c.generation,0) FROM sessions s LEFT JOIN connection_sessions c ON c.session_id=s.id WHERE s.id=?", id).Scan(&v.ID, &v.TenantID, &v.BrokerID, &v.RelayMode, &peer, &relay, &expiry, &v.ConnectionID, &v.Generation)
 	if errors.Is(e, sql.ErrNoRows) {
 		return v, fail(404, "session not found")
 	}
@@ -525,6 +557,9 @@ func txPrincipal(tx *sql.Tx, r *http.Request, p principal) error {
 	return txActive(tx, p)
 }
 func txSessionLive(tx *sql.Tx, v Session) error {
+	if err := txManagedSession(tx, v); err != nil {
+		return err
+	}
 	var expiry, lease int64
 	err := tx.QueryRow("SELECT sessions.expires_at,brokers.lease_expires_at FROM sessions JOIN brokers ON brokers.id=sessions.broker_id WHERE sessions.id=? AND sessions.tenant_id=? AND sessions.broker_id=?", v.ID, v.TenantID, v.BrokerID).Scan(&expiry, &lease)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -595,6 +630,9 @@ func (s *Server) maintenance() {
 				}
 			}
 			_, _ = s.db.Exec("DELETE FROM tokens WHERE expires_at<=? OR (kind='session' AND NOT EXISTS(SELECT 1 FROM sessions WHERE sessions.id=tokens.session_id)) OR (kind='device' AND NOT EXISTS(SELECT 1 FROM brokers WHERE brokers.id=tokens.broker_id))", now())
+			// Unknown lineages fail closed. Never discard an authorized idle
+			// connection merely because its transport lease naturally expired.
+			_ = s.pruneConnections()
 		}
 	}
 }
@@ -695,7 +733,7 @@ func (s *Server) authorizeTURN(tenant, broker, session string) bool {
 		return false
 	}
 	v, e := s.session(session)
-	if e != nil || v.TenantID != tenant || v.BrokerID != broker || !v.PeerAuthenticated || !v.RelayApproved || v.RelayMode == "never" || !v.ExpiresAt.After(time.Now()) {
+	if e != nil || s.managedSession(v) != nil || v.TenantID != tenant || v.BrokerID != broker || !v.PeerAuthenticated || !v.RelayApproved || v.RelayMode == "never" || !v.ExpiresAt.After(time.Now()) {
 		return false
 	}
 	if s.cfg.TenantDailyByteQuota > 0 {

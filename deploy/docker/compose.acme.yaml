@@ -3,7 +3,7 @@
 # Prepare the UID 10001 private bind directories first; see docs/DOCKER.md.
 services:
   broker:
-    image: ${BROKER_IMAGE:-ghcr.io/oheco/oheco-broker:0.3.0}
+    image: ${BROKER_IMAGE:-ghcr.io/oheco/oheco-broker:0.4.0}
     user: "10001:10001"
     network_mode: bridge
     ports:

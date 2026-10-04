@@ -9,10 +9,15 @@ on:
       version:
         description: 'Existing application release version (without v)'
         required: true
-        default: '0.3.0'
+        default: '0.4.0'
         type: string
       image_tag:
         description: 'Optional image tag: VERSION or VERSION-docker.N (positive N)'
+        required: false
+        default: ''
+        type: string
+      source_revision:
+        description: 'Optional full commit SHA for pre-release verification; requires publish=false'
         required: false
         default: ''
         type: string
@@ -61,6 +66,9 @@ jobs:
         env:
           RELEASE_VERSION: ${{ inputs.version }}
           IMAGE_TAG_INPUT: ${{ inputs.image_tag }}
+          VALIDATION_REVISION: ${{ inputs.source_revision }}
+          PUBLISH_REQUESTED: ${{ inputs.publish }}
+          VERIFY_ONLY_REQUESTED: ${{ inputs.verify_only }}
           EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
           RECIPE_REVISION: ${{ github.sha }}
@@ -69,7 +77,13 @@ jobs:
           set -euo pipefail
           if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
             [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
-            source_ref="refs/tags/v$RELEASE_VERSION"
+            if [[ -n "$VALIDATION_REVISION" ]]; then
+              [[ "$VALIDATION_REVISION" =~ ^[0-9a-f]{40}$ ]]
+              [[ "$PUBLISH_REQUESTED" == false && "$VERIFY_ONLY_REQUESTED" == false ]]
+              source_ref="$VALIDATION_REVISION"
+            else
+              source_ref="refs/tags/v$RELEASE_VERSION"
+            fi
           elif [[ "$REF" == refs/tags/v* ]]; then
             RELEASE_VERSION="${REF#refs/tags/v}"
             [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]

@@ -11,8 +11,8 @@ priv=$(mktemp -d "${TMPDIR%/}/oheco-remote-tests.XXXXXX")
 trap 'rm -rf "$priv"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-mkdir -p "$priv/temp" "$priv/home"
-export TMPDIR="$priv/temp" GOTMPDIR="$priv/temp" HOME="$priv/home"
+mkdir -p "$priv/temp" "$priv/config"
+export TMPDIR="$priv/temp" GOTMPDIR="$priv/temp" XDG_CONFIG_HOME="$priv/config"
 # A fresh cache ensures Go/cgo cannot reuse links against old external archives.
 export GOCACHE="$priv/gocache" GOPROXY=off GOSUMDB=off GOFLAGS=-mod=vendor
 cd "$root"
@@ -20,8 +20,8 @@ if [ "${OB_SKIP_GO_CHECKS:-0}" != 1 ]; then
     go test -count=1 -timeout=180s -exec "sh $root/scripts/go-test-exec.sh" ./...
     go vet ./...
 fi
-# Isolated HOME deliberately has no user's Git safe.directory configuration.
-# Local fixtures record the source baseline separately, not via VCS stamping.
+# Local fixtures use private config and record the source baseline separately,
+# rather than relying on the caller's Git configuration or VCS stamping.
 go build -buildvcs=false -trimpath -o "$priv/oheco-broker" ./cmd/oheco-broker
 go build -buildvcs=false -trimpath -o "$priv/control-fixture" ./tests/control-server
 clang -std=c11 -D_GNU_SOURCE -DJUICE_STATIC -DCURL_STATICLIB -Wall -Wextra -Werror -pthread \
@@ -45,4 +45,6 @@ python3 "$root/tests/cli_control.py" "$priv/oheco-broker"
 python3 "$root/tests/remote_acceptance.py" --fixture "$priv/control-fixture" \
     --native "$OB_REMOTE_TEST" --api-test "$priv/remote-api-test" --binary "$priv/oheco-broker"
 python3 "$root/tests/peer_lifecycle.py" --fixture "$priv/control-fixture" --binary "$priv/oheco-broker"
-printf '%s\n' 'PASS local Go/SQLite/Pion STUN-TURN/C API/xquic TCP-UDP/Go CLI acceptance'
+python3 "$root/tests/peer_recovery.py" --fixture "$priv/control-fixture" \
+    --native "$OB_RECOVERY_TEST" --preload "$OB_UDP_FAULT_PRELOAD"
+printf '%s\n' 'PASS local Go/SQLite/Pion STUN-TURN/C API/xquic TCP-UDP/recovery/Go CLI acceptance'

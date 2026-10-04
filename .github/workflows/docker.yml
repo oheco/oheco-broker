@@ -79,20 +79,21 @@ jobs:
           pathlib.Path(target).write_text(json.dumps({'version':version,'source_revision':source,'recipe_revision':recipe})+'\n')
           PY
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - name: Check the nonroot ACME privileged-port policy
+      - name: Check the isolated ACME network and nonroot policy
         shell: bash
         run: |
           set -euo pipefail
           docker run --rm --user 10001:10001 --network bridge \
-            --sysctl net.ipv4.ip_unprivileged_port_start=1024 \
-            --cap-drop ALL --cap-add NET_BIND_SERVICE \
-            --security-opt no-new-privileges:true \
+            --sysctl net.ipv4.ip_unprivileged_port_start=0 \
+            --cap-drop ALL --security-opt no-new-privileges:true \
             debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 \
-            sh -c 'grep "^CapEff:" /proc/self/status' > "$RUNNER_TEMP/image-output/bind-capability.log"
+            sh -c 'grep "^CapEff:" /proc/self/status; cat /proc/sys/net/ipv4/ip_unprivileged_port_start' \
+            > "$RUNNER_TEMP/image-output/bind-capability.log"
           python3 - "$RUNNER_TEMP/image-output/bind-capability.log" <<'PY'
           import pathlib,sys
-          value=int(pathlib.Path(sys.argv[1]).read_text().split()[1],16)
-          assert value == 1<<10, 'The nonroot ACME process must have only NET_BIND_SERVICE; received '+hex(value)
+          lines=pathlib.Path(sys.argv[1]).read_text().splitlines()
+          assert int(lines[0].split()[1],16)==0, 'ACME deployment must drop all capabilities'
+          assert lines[1]=='0', 'The bridge network namespace must allow UID10001 to bind container TCP443'
           PY
       - name: Build and run application tests on the native architecture
         env:

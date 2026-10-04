@@ -6,12 +6,12 @@
 
 | 模式 | Compose／环境模板 | HTTPS/WSS | 签发与续期 |
 |---|---|---|---|
-| 内置 ACME | [compose.acme.yaml](../deploy/docker/compose.acme.yaml)／[.env.acme.example](../deploy/docker/.env.acme.example) | 主机 TCP 443 | 服务端通过 TLS-ALPN-01 自动获取、续期；持久化 ACME 缓存 |
-| 外部证书 | [compose.static.yaml](../deploy/docker/compose.static.yaml)／[.env.static.example](../deploy/docker/.env.static.example) | 主机 TCP 3478，可改为其他非特权端口 | acme.sh、Certbot 或其他 issuer 签发；服务只读导出目录，每 30 秒加载有效更新 |
+| 内置 ACME | [compose.acme.yaml](../deploy/docker/compose.acme.yaml)／[.env.acme.example](../deploy/docker/.env.acme.example) | bridge 网络，主机 TCP 443 发布到容器 TCP 443 | 服务端通过 TLS-ALPN-01 自动获取、续期；持久化 ACME 缓存 |
+| 外部证书 | [compose.static.yaml](../deploy/docker/compose.static.yaml)／[.env.static.example](../deploy/docker/.env.static.example) | host 网络，主机 TCP 3478，可改为其他非特权端口 | acme.sh、Certbot 或其他 issuer 签发；服务只读导出目录，每 30 秒加载有效更新 |
 
-两个例子均使用 **Linux `network_mode: host`**，监听 `0.0.0.0`。主机 UDP 3478 用于 STUN/TURN，UDP 50000–50100 为显式设置的 relay 范围，包含两端。TCP 3478 和 UDP 3478 是独立 socket，可以同时运行 HTTPS 和 TURN。当前 TURN 只支持 UDP/IPv4。
+**内置 ACME 使用 Linux bridge 网络**，由 Docker 将主机 TCP 443、UDP 3478 和 UDP 50000–50100 发布到容器内相同端口。**外部证书使用 `network_mode: host`**，直接使用主机网卡及端口，不填写 Compose `ports:`。两者的服务 listener 都绑定其网络命名空间内的 `0.0.0.0`。
 
-主机网络直接使用主机网卡及端口，不填写 Compose `ports:`。准备 DNS A 记录、实际可达公网 IPv4，以及以下安全组／主机防火墙／NAT 规则：
+主机 UDP 3478 用于 STUN/TURN，UDP 50000–50100 为显式设置的 relay 范围，包含两端。TCP 3478 和 UDP 3478 是独立 socket，外部证书模式可以同时运行 HTTPS 和 TURN。当前 TURN 只支持 UDP/IPv4。准备 DNS A 记录、实际可达公网 IPv4，以及以下安全组／主机防火墙／NAT 规则：
 
 | 流量 | 内置 ACME | 外部证书默认值 |
 |---|---|---|
@@ -19,9 +19,11 @@
 | STUN/TURN | UDP 3478 | UDP 3478 |
 | TURN relay | UDP 50000–50100 | UDP 50000–50100 |
 
-还需允许服务到合法 peer 的 UDP 流量及返回流量；内置 ACME 需出站 HTTPS 访问 CA。`BROKER_PUBLIC_IPV4` 必须是实际对外 IPv4，不能填 `0.0.0.0`。云 NAT 地址不在网卡上时，监听仍用 `0.0.0.0`，公告公网地址，并由部署者配置端口转发。更改 relay 上下界时同时更新防火墙；端口池不是并发会话数，耗尽后 allocation 失败，不回退到范围外。
+还需允许服务到合法 peer 的 UDP 流量及返回流量；内置 ACME 需出站 HTTPS 访问 CA。`BROKER_PUBLIC_IPV4` 必须是实际对外 IPv4，不能填 `0.0.0.0` 或容器的 bridge 私网地址。bridge 模式的 Docker NAT 将每个 relay UDP 端口发布到相同主机端口，与 TURN 公告的公网 IPv4／端口一致；不要只发布 UDP 3478 或改变 relay 的内外端口对应关系。主机防火墙必须允许 Docker 发布端口的转发路径及返回流量。
 
-内置 ACME 要求域名 TCP 443 **直接到达此服务的 TLS listener**，支持 `acme-tls/1` ALPN。TLS 终止代理、CDN、错误 DNS 或其他进程占用 443 会阻止签发／续期。若发布 AAAA，也必须保证其验证流量可达；本文模板监听 IPv4。部署者先检查现有 443 listener，并自行安排端口归属，模板不停止其他服务。此模式不需要 TCP 80，不支持将 HTTPS 改到 3478 后继续使用内置 TLS-ALPN-01。
+云 NAT 地址不在网卡上时，监听仍用 `0.0.0.0`，公告公网地址，并由部署者配置相同端口的转发。更改 relay 上下界时，ACME Compose 自动用同一环境变量更新 published range，还需同时更新防火墙和外层 NAT。端口池不是并发会话数，耗尽后 allocation 失败，不回退到范围外。
+
+内置 ACME 要求域名 TCP 443 **经端口发布直接到达此服务的 TLS listener**，支持 `acme-tls/1` ALPN。Docker 转发保持 TLS 流量交给容器内服务端处理；TLS 终止代理、CDN、错误 DNS 或其他进程占用主机 443 会阻止签发／续期。若发布 AAAA，也必须保证其验证流量可达；服务 listener 使用 IPv4。部署者先检查现有 443 listener，并自行安排端口归属，模板不停止其他服务。此模式不需要 TCP 80，不支持将 HTTPS 改到 3478 后继续使用内置 TLS-ALPN-01。
 
 外部证书可用 DNS-01，也可在其他主机签发后安全导出；broker 本身不需要开放 TCP 443 或 TCP 80。证书必须覆盖客户端使用的域名，并包含完整中间证书链。公有 CA 使用镜像内的系统 CA；私有 CA 客户端通过 `--ca-file` 指定信任文件。
 
@@ -83,7 +85,9 @@ docker compose --env-file deploy/docker/.env.acme \
   -f deploy/docker/compose.acme.yaml logs --tail=100 broker
 ```
 
-ACME Compose 先移除全部 capabilities，再仅授予 `NET_BIND_SERVICE` 以支持非 root 绑定主机 TCP 443。首次启动会签发证书，后续启动复用持久化账号和证书，运行中自动续期。保留缓存，不要把日常重启变成重复注册和签发。检查 `acme_ready`、`certificate_served`、`server_ready`；CA、DNS 或端口错误时先处理原因再重试。需要 staging 测试时选用独立状态目录并设置 staging directory URL；staging 证书不受公有信任，不与 production 缓存混用。
+ACME Compose 在独立容器网络命名空间中设置 `net.ipv4.ip_unprivileged_port_start=0`，允许 UID 10001 绑定容器 TCP 443；保留 `cap_drop: ALL` 和 `no-new-privileges`，不需要网络 capability。此 sysctl 只影响该容器的网络命名空间，不修改宿主 sysctl。普通 rootful Docker Engine 负责发布主机 TCP 443。使用 rootless Docker 时，其主机低端口发布限制仍然适用，部署者需先配置可用的 443 发布／转发方式，容器 sysctl 不能解决该宿主限制。
+
+首次启动会签发证书，后续启动复用持久化账号和证书，运行中自动续期。保留缓存，不要把日常重启变成重复注册和签发。检查 `acme_ready`、`certificate_served`、`server_ready`；CA、DNS 或端口错误时先处理原因再重试。需要 staging 测试时选用独立状态目录并设置 staging directory URL；staging 证书不受公有信任，不与 production 缓存混用。
 
 ## 外部签发与续期导出
 
@@ -168,7 +172,7 @@ sudo stat -c '%F %u:%g %a %n' \
 cp deploy/docker/.env.static.example deploy/docker/.env.static
 ```
 
-编辑 `.env.static`，填写公网 IPv4 和准备好的状态／secret／证书导出目录。`BROKER_HTTPS_PORT=3478` 表示 **HTTPS TCP 3478**，TURN 仍用 **UDP 3478**；可选择其他大于等于 1024 的可用 TCP 端口。若自行改为特权端口，需要相应的 `NET_BIND_SERVICE` 能力配置。首次启动必须已有匹配、有效的证书与私钥。
+编辑 `.env.static`，填写公网 IPv4 和准备好的状态／secret／证书导出目录。`BROKER_HTTPS_PORT=3478` 表示 **HTTPS TCP 3478**，TURN 仍用 **UDP 3478**；此 host 网络模板可选择其他大于等于 1024 的可用 TCP 端口。首次启动必须已有匹配、有效的证书与私钥。
 
 ```sh
 docker compose --env-file deploy/docker/.env.static \
@@ -249,7 +253,7 @@ docker build -t oheco-broker:0.3.0 .
 
 镜像构建使用仓库中固定的 Go vendor 和 C SDK 依赖；首次拉取基础镜像、构建工具及系统包需要网络。应用 MIT，镜像的项目与依赖许可证位于 `/usr/share/licenses/oheco-broker/`，系统包版权记录位于 `/usr/share/doc/`。libjuice 及其他依赖保留各自许可证和源码义务，见[依赖记录](NATIVE-DEPENDENCIES.md)与[根许可证](../LICENSE)。完整 CLI 包含 C peer 引擎；默认独立服务端不链接该引擎。
 
-Compose 示例给出 1 CPU、512 MiB 内存、128 个进程上限和每个服务最多 3×10 MiB 的 JSON 日志。按实际并发与 relay 流量调整这些限制及端口范围；观察 CPU、内存、磁盘和带宽。主机网络不提供端口命名空间隔离，同一组端口同时只能由一个实例持有。
+Compose 示例给出 1 CPU、512 MiB 内存、128 个进程上限和每个服务最多 3×10 MiB 的 JSON 日志。按实际并发与 relay 流量调整这些限制及端口范围；观察 CPU、内存、磁盘和带宽。外部证书例子的 host 网络直接占用主机端口，ACME 例子的 published ports 也占用对应主机端口；两种模板是替代部署方案，相同主机端口同时只能由一个实例持有。
 
 更新前保存一致的 SQLite 备份，并单独保护管理员 token、ACME 缓存或外部 issuer 的账号／证书、CLI 账号配置。可停止服务后备份整个状态目录，或由受控备份工具使用 SQLite backup API；不要在服务写入时只复制数据库主文件。拉取已验证的新镜像后用同一 Compose／环境文件 `up -d` 替换容器，保留 bind 目录；数据库有迁移时回滚同时需要兼容旧程序的一致备份。`docker compose down` 不删除宿主 bind 数据。
 

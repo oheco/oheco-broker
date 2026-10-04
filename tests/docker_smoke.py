@@ -155,24 +155,25 @@ class Smoke:
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
                          urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=str(self.ca))))
 
-    def options(self, *, cap=False, trust=False, bridge=False):
+    def options(self, *, trust=False, bridge=False, privileged_port_start=0, publish_https=False):
         result = ["--network", "bridge" if bridge else "host", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
                   "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,mode=1777",
                   "--mount", f"type=bind,src={self.state},dst={STATE}",
                   "--mount", f"type=bind,src={self.tls},dst={TLS},readonly",
                   "--mount", f"type=bind,src={self.secret_dir},dst={SECRETS},readonly"]
-        if cap:
-            result += ["--cap-add", "NET_BIND_SERVICE"]
         if bridge:
-            result += ["--sysctl", "net.ipv4.ip_unprivileged_port_start=1024", "--publish", "127.0.0.1::443"]
+            result += ["--sysctl", f"net.ipv4.ip_unprivileged_port_start={privileged_port_start}"]
+        if publish_https:
+            require(bridge, "HTTPS port publication requires an isolated bridge namespace")
+            result += ["--publish", "127.0.0.1:443:443/tcp"]
         if trust:
             result += ["--mount", f"type=bind,src={self.trust},dst=/etc/ssl/certs/ca-certificates.crt,readonly"]
         return result
 
-    def start(self, command, *, entrypoint=None, cap=False, bridge=False):
+    def start(self, command, *, entrypoint=None, bridge=False, privileged_port_start=0, publish_https=False):
         name = "oheco-docker-smoke-" + secrets.token_hex(8)
         self.names.append(name)
-        options = self.options(cap=cap, bridge=bridge)
+        options = self.options(bridge=bridge, privileged_port_start=privileged_port_start, publish_https=publish_https)
         if entrypoint:
             options += ["--entrypoint", entrypoint]
         self.docker("run", "--detach", "--name", name, *options, self.args.image, *command)
@@ -237,14 +238,17 @@ class Smoke:
             result += ["--turn-listen", "127.0.0.1:0", "--turn-public-ip", "127.0.0.1", "--turn-allow-loopback"]
         return result
 
-    def check_process(self, name, *, cap=False):
+    def check_identity(self, status):
+        fields = dict(line.split(":", 1) for line in status.splitlines() if ":" in line)
+        require(fields["Uid"].split() == ["10001"] * 4 and fields["Gid"].split() == ["10001"] * 4, "process is not UID/GID 10001")
+        require(fields["NoNewPrivs"].strip() == "1", "no-new-privileges is missing")
+        require(int(fields["CapEff"].strip(), 16) == 0, "process must have zero effective capabilities")
+        return fields
+
+    def check_process(self, name):
         proc = self.docker("exec", name, "/bin/sh", "-ec", "readlink /proc/1/exe; cat /proc/1/status").stdout
         require(proc.splitlines()[0] == "/usr/local/bin/oheco-broker-server", "server is not PID 1")
-        fields = dict(line.split(":", 1) for line in proc.splitlines()[1:] if ":" in line)
-        require(fields["Uid"].split() == ["10001"] * 4 and fields["Gid"].split() == ["10001"] * 4, "server is not UID/GID 10001")
-        require(fields["NoNewPrivs"].strip() == "1", "no-new-privileges is missing")
-        capabilities = int(fields["CapEff"].strip(), 16)
-        require(capabilities == (1 << 10 if cap else 0), "unexpected effective capabilities")
+        self.check_identity("\n".join(proc.splitlines()[1:]))
 
     def control(self):
         server = self.start(self.server_flags())
@@ -304,6 +308,7 @@ class Smoke:
         self.api("POST", "/v1/tenants/register", body={"name": "closed-account", "password": secrets.token_hex(16)}, expected=403)
         self.stop(restarted)
         print(f"PASS persisted SQLite/settings/profile across recreation and clean PID 1 TERM ({elapsed:.2f}s)", flush=True)
+        self.static_ports()
         self.low_port()
 
     def stun(self, address):
@@ -342,42 +347,71 @@ class Smoke:
             self.stop(broker)
             print("PASS actual Pion TURN relay payload accounting", flush=True)
 
-    def low_port(self):
-        # First enforce privileged ports in an isolated bridge netns. A host
-        # sysctl of zero must not mask lost capabilities for the nonroot user.
-        strict = self.start(self.server_flags("0.0.0.0:443", turn=False), cap=True, bridge=True)
-        self.event(strict, "server_ready")
-        self.check_process(strict, cap=True)
-        threshold = self.docker("exec", strict, "cat", "/proc/sys/net/ipv4/ip_unprivileged_port_start").stdout.strip()
-        require(threshold == "1024", "privileged-port probe did not enforce the kernel threshold")
-        published = self.docker("port", strict, "443/tcp").stdout.strip()
-        require(published.startswith("127.0.0.1:"), "strict TCP 443 probe was not published only on loopback")
-        self.api_url = "https://" + published
-        require(self.api("GET", "/v1/admin/info", token=self.admin)["storage"] == "sqlite3", "privileged bridge TCP 443 TLS request failed")
-        self.stop(strict)
-        print("PASS UID10001 privileged TCP 443 bind in bridge netns (threshold 1024, NET_BIND_SERVICE, no-new-privileges)", flush=True)
-        # Then exercise the documented host-network deployment independently.
-        with socket.socket() as probe:
-            try:
-                probe.bind(("127.0.0.1", 443))
-            except OSError as error:
-                raise AssertionError("test runner TCP 443 must be available for the host-network capability probe") from error
-        server = self.start(self.server_flags("127.0.0.1:443", turn=False), cap=True)
+    def static_ports(self):
+        flags = self.server_flags("127.0.0.1:3478", turn=False) + [
+            "--turn-listen", "127.0.0.1:3478", "--turn-public-ip", "127.0.0.1", "--turn-allow-loopback"]
+        server = self.start(flags)
         ready = self.event(server, "server_ready")
-        require(ready["api"] == "https://127.0.0.1:443", "nonroot service did not bind TCP 443")
-        self.check_process(server, cap=True)
+        require(ready["api"] == "https://127.0.0.1:3478" and ready["turn"] == "127.0.0.1:3478" and
+                ready["turn_advertised"] == "127.0.0.1:3478", "static TLS TCP/TURN UDP port 3478 did not coexist")
+        self.check_process(server)
         self.api_url = ready["api"]
-        require(self.api("GET", "/v1/admin/info", token=self.admin)["storage"] == "sqlite3", "TLS on TCP 443 failed")
+        self.api("GET", "/v1/admin/info", expected=401)
+        info = self.cli_json(server, "admin", "--token-file", SECRETS + "/admin.token", "info")
+        require(info["storage"] == "sqlite3" and info["turn_addr"] == "127.0.0.1:3478", "static TCP 3478 verified HTTPS/admin query failed")
+        self.stun(ready["turn_advertised"])
+        self.stop(server)
+        print("PASS host-network static TLS HTTPS on TCP 3478 and Pion STUN/TURN on UDP 3478 coexist with UID10001/all capabilities dropped", flush=True)
+
+    def low_port(self):
+        # This wrapper exists only to record credentials/sysctl before the
+        # expected fast bind failure; it execs the real server for that attempt.
+        probe = """
+            while IFS= read -r line; do
+                case "$line" in Uid:*|Gid:*|CapEff:*|NoNewPrivs:*) printf '%s\\n' "$line";; esac
+            done < /proc/1/status
+            printf 'ip_unprivileged_port_start: %s\\n' "$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start)"
+            exec /usr/local/bin/oheco-broker-server "$@"
+        """
+        strict = self.start(["-ec", probe, "port-probe", *self.server_flags("0.0.0.0:443", turn=False)],
+                            entrypoint="/bin/sh", bridge=True, privileged_port_start=1024)
+        result = self.docker("wait", strict, timeout=15)
+        output = self.logs(strict)
+        fields = self.check_identity(output)
+        require(fields["ip_unprivileged_port_start"].strip() == "1024", "negative probe did not enforce privileged ports")
+        require(result.stdout.strip() == "1" and "bind: permission denied" in output and "443" in output and
+                '"server_ready"' not in output, "UID10001 unexpectedly bound privileged TCP 443 or failed before the bind")
+        require(not self.inspect(strict)["State"]["OOMKilled"], "negative port probe was OOM-killed")
+        print("PASS UID10001/capabilities zero cannot bind TCP 443 with namespace threshold 1024", flush=True)
+
+        # ACME requires container TCP 443. The selected bridge deployment lowers
+        # only its netns threshold and publishes host TCP 443; no capabilities or
+        # host sysctl changes are needed. Static fixture TLS avoids CA traffic.
+        flags = self.server_flags("0.0.0.0:443", turn=False)
+        server = self.start(flags, bridge=True, privileged_port_start=0, publish_https=True)
+        ready = self.event(server, "server_ready")
+        require(urlsplit(ready["api"]).scheme == "https" and urlsplit(ready["api"]).port == 443, "nonroot bridge service did not bind actual container TCP 443")
+        self.check_process(server)
+        threshold = self.docker("exec", server, "cat", "/proc/sys/net/ipv4/ip_unprivileged_port_start").stdout.strip()
+        require(threshold == "0", "bridge did not set its unprivileged-port threshold to zero")
+        published = self.docker("port", server, "443/tcp").stdout.strip()
+        require(published == "127.0.0.1:443", "container TCP 443 must publish only to host loopback TCP 443")
+        self.api_url = "https://127.0.0.1:443"
+        self.api("GET", "/v1/admin/info", expected=401)
+        require(self.api("GET", "/v1/admin/info", token=self.admin)["storage"] == "sqlite3", "published TCP 443 verified HTTPS/admin query failed")
         self.docker("exec", server, "/bin/sh", "-ec", """
             test "$(stat -c '%u:%g:%a' /var/lib/oheco-broker/acme)" = 10001:10001:700
             umask 077; printf smoke > /var/lib/oheco-broker/acme/.docker-smoke
+            test "$(stat -c '%u:%g:%a' /var/lib/oheco-broker/acme/.docker-smoke)" = 10001:10001:600
         """)
         self.stop(server)
-        again = self.start(self.server_flags("127.0.0.1:443", turn=False), cap=True)
+        again = self.start(flags, bridge=True, privileged_port_start=0, publish_https=True)
         self.event(again, "server_ready")
+        self.check_process(again)
         self.docker("exec", again, "/bin/sh", "-ec", "test \"$(cat /var/lib/oheco-broker/acme/.docker-smoke)\" = smoke; rm /var/lib/oheco-broker/acme/.docker-smoke")
+        require(self.api("GET", "/v1/admin/info", token=self.admin)["storage"] == "sqlite3", "recreated bridge TCP 443 verified HTTPS failed")
         self.stop(again)
-        print("PASS nonroot host-network TCP 443 with NET_BIND_SERVICE/no-new-privileges and persisted private ACME cache directory", flush=True)
+        print("PASS nonroot bridge TCP 443 published to host TCP 443 with namespace threshold zero, capabilities zero, no-new-privileges and persisted private ACME cache directory", flush=True)
 
     def cleanup(self):
         failures = []

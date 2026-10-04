@@ -14,4 +14,6 @@ tests/build-fixture/bin
 tests/build-fixture/obj
 .env
 .env.local
+/deploy/docker/.env.acme
+/deploy/docker/.env.static
 *.user

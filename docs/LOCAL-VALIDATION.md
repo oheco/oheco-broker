@@ -57,4 +57,6 @@ python3 tests/production_acceptance.py \
 | `oheco-broker-0.3.0-ohos-arm64.tar.gz` | 110389864 | `57b17ebf1bcb768d1c480fca0207027719b9f54ae0830fcf2a016d779d2a973a` |
 | `oheco-broker-0.3.0-sdk-source.tar.gz` | 84851015 | `6d9255dc4ba8f1af90fa69f8954abfac01956046b79a625c7234b6bebd11cf27` |
 
-复核记录和验收脚本的后续提交只补充证据／测试隔离顺序，不改变已发布源码 SDK、运行包、标签或附件字节。
+SDK 分发更正由[目录提交](https://github.com/oheco/oheco-packages/commit/2e794b1581c565d9eda4f1b93db81b6d300a600d)及[Pages 工作流](https://github.com/oheco/oheco-packages/actions/runs/37171686574)部署。正式索引已撤销 SDK 的 `projects`，回到 schema v2；通过更正后的正式索引重新完成隔离安装、双命令版本、安装目录内 C/Go/.NET 源码与离线输入、卸载验证。SDK 源码通过安装目录或 Release 附件获取。
+
+独立 SDK 附件的原始 README 中误写了 DevEco 导出用法，Release 说明及当前源码文档已明确更正。后续提交修正文档、登记和验收记录，不改变已发布源码 SDK、运行包、标签或附件字节。

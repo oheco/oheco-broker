@@ -76,7 +76,7 @@ func TestAsyncRecoveryPreservesHandleAndListener(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer peer.Close()
-	if err = peer.SetReconnectPolicy(ReconnectPolicy{Disabled: true}); err != nil {
+	if err = peer.SetReconnectPolicy(ReconnectPolicy{Disabled: true, InitialDelay: 5 * time.Second, MaxDelay: 5 * time.Second}); err != nil {
 		t.Fatal(err)
 	}
 	mapping, err := peer.Map(TCP, "127.0.0.1", 0, "127.0.0.1", 1)
@@ -146,13 +146,13 @@ func TestAsyncRecoveryPreservesHandleAndListener(t *testing.T) {
 		}
 		return true
 	})
-	if err = peer.SetReconnectPolicy(ReconnectPolicy{MaxAttempts: 2, InitialDelay: time.Second, MaxDelay: time.Second}); err != nil {
+	const retryMaximum = 100 * time.Millisecond
+	if err = peer.SetReconnectPolicy(ReconnectPolicy{MaxAttempts: 2, InitialDelay: retryMaximum, MaxDelay: retryMaximum}); err != nil {
 		t.Fatal(err)
 	}
-	if err = peer.Reconnect(); err != nil {
-		t.Fatal(err)
-	}
-	wait("automatic RETRY_WAIT snapshot", func() bool {
+	// The paused manual attempt queued a five-second retry. Enable the tighter
+	// policy and inspect that retained deadline before a manual reset discards it.
+	wait("reenabled queued RETRY_WAIT snapshot before manual reset", func() bool {
 		info, e := peer.GetConnectionInfo()
 		if e != nil {
 			t.Fatal(e)
@@ -160,7 +160,25 @@ func TestAsyncRecoveryPreservesHandleAndListener(t *testing.T) {
 		if info.State != StateRetryWait {
 			return false
 		}
-		if info.NextRetry <= 0 || info.NextRetry > time.Second {
+		if info.NextRetry <= 0 || info.NextRetry > retryMaximum {
+			t.Fatalf("new policy retained an out-of-bounds queued retry: %+v", info)
+		}
+		return true
+	})
+	before = requests.Load()
+	if err = peer.Reconnect(); err != nil {
+		t.Fatal(err)
+	}
+	wait("manual HTTP attempt after policy update", func() bool { return requests.Load() > before })
+	wait("automatic RETRY_WAIT snapshot after manual reset", func() bool {
+		info, e := peer.GetConnectionInfo()
+		if e != nil {
+			t.Fatal(e)
+		}
+		if info.State != StateRetryWait {
+			return false
+		}
+		if info.NextRetry <= 0 || info.NextRetry > retryMaximum {
 			t.Fatalf("waiting peer did not advertise its bounded retry: %+v", info)
 		}
 		return true

@@ -33,6 +33,17 @@ void ob_recovery_init(struct ob_recovery *r)
     memset(r, 0, sizeof(*r)); ob_remote_reconnect_policy_init(&r->policy);
     atomic_init(&r->requested, 0); r->info.state = OB_REMOTE_STATE_CONNECTING;
 }
+void ob_recovery_apply_policy_locked(struct ob_recovery *r,
+                                     const ob_remote_reconnect_policy *policy)
+{
+    r->policy = *policy;
+    if (!r->retry_us) return;
+    uint64_t maximum = ob_now_us() + (uint64_t)policy->max_delay_ms * 1000;
+    if (r->retry_us > maximum) {
+        r->retry_us = maximum;
+        if (r->info.state == OB_REMOTE_STATE_RETRY_WAIT) r->callback_pending = 1;
+    }
+}
 void ob_recovery_set_locked(struct ob_recovery *r, ob_remote_connection_state state,
                             const ob_remote_error *error)
 {
@@ -63,7 +74,7 @@ int ob_remote_peer_set_reconnect_policy(ob_remote_peer *p,
 {
     ob_remote_reconnect_policy normalized;
     if (!p || normalize(policy, &normalized)) return ob_error(error, OB_REMOTE_EINVAL, 0, NULL);
-    pthread_mutex_lock(&p->mu); p->recovery.policy = normalized;
+    pthread_mutex_lock(&p->mu); ob_recovery_apply_policy_locked(&p->recovery, &normalized);
     pthread_cond_broadcast(&p->cv); pthread_mutex_unlock(&p->mu); ob_wake(p);
     return ob_error(error, 0, 0, NULL);
 }
@@ -72,7 +83,7 @@ int ob_remote_server_set_reconnect_policy(ob_remote_server *s,
 {
     ob_remote_reconnect_policy normalized;
     if (!s || normalize(policy, &normalized)) return ob_error(error, OB_REMOTE_EINVAL, 0, NULL);
-    pthread_mutex_lock(&s->mu); s->recovery.policy = normalized;
+    pthread_mutex_lock(&s->mu); ob_recovery_apply_policy_locked(&s->recovery, &normalized);
     pthread_cond_broadcast(&s->cv); pthread_mutex_unlock(&s->mu);
     return ob_error(error, 0, 0, NULL);
 }

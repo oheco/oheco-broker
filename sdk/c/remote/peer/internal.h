@@ -131,6 +131,10 @@ void ob_peer_fail_locked(ob_remote_peer *p, int code, const char *message);
 void ob_peer_transport_fail_locked(ob_remote_peer *p, int code, const char *message);
 void ob_peer_transport_fail(ob_remote_peer *p, int code, const char *message);
 void ob_recovery_init(struct ob_recovery *recovery);
+/* Caller holds the enclosing handle's mutex and supplies a normalized policy.
+ * Retained retry deadlines may move earlier; outage/grace/budget ages are kept. */
+void ob_recovery_apply_policy_locked(struct ob_recovery *recovery,
+                                     const ob_remote_reconnect_policy *policy);
 void ob_recovery_set_locked(struct ob_recovery *recovery,
                             ob_remote_connection_state state,
                             const ob_remote_error *error);

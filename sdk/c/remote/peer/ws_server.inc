@@ -65,7 +65,8 @@ static void server_snapshot(ob_remote_server *s, cJSON *response)
             ob_remote_peer *p = ob_peer_alloc(s->api, s->broker_id, s->password, &options);
             if (!p) { free(seen); continue; }
             p->is_server = 1; p->server = s; p->control_discovered = 1;
-            pthread_mutex_lock(&s->mu); p->recovery.policy = s->recovery.policy; pthread_mutex_unlock(&s->mu);
+            pthread_mutex_lock(&s->mu); ob_remote_reconnect_policy policy = s->recovery.policy; pthread_mutex_unlock(&s->mu);
+            pthread_mutex_lock(&p->mu); ob_recovery_apply_policy_locked(&p->recovery, &policy); pthread_mutex_unlock(&p->mu);
             if (connection) {
                 memcpy(p->connection_id, connection, 37); p->control_managed = 1; p->control_generation = generation;
             }
@@ -107,6 +108,8 @@ static int server_retry_allowed(ob_remote_server *s, int connected, uint64_t now
         r->info.attempts = 0; r->outage_us = now; r->retry_us = 0; *reconnect = 0;
         s->manual_attempt = 1;
     }
+    /* Policy changes clamp the authoritative deadline on the caller thread. */
+    *reconnect = r->retry_us;
     if (connected && r->stable_us && now - r->stable_us >= (uint64_t)r->policy.stable_reset_ms * 1000) {
         r->info.attempts = 0; r->outage_us = 0;
     }
@@ -235,7 +238,7 @@ void *ob_server_worker(void *data)
         while (*link) {
             ob_remote_peer *p = *link;
             pthread_mutex_lock(&s->mu); ob_remote_reconnect_policy policy = s->recovery.policy; pthread_mutex_unlock(&s->mu);
-            pthread_mutex_lock(&p->mu); p->recovery.policy = policy;
+            pthread_mutex_lock(&p->mu); ob_recovery_apply_policy_locked(&p->recovery, &policy);
             uint64_t deadline = p->recovery_deadline_us ? p->recovery_deadline_us
                 : p->deadline_us + (uint64_t)policy.flow_grace_ms * 1000;
             if (p->control_managed && !p->transport_available && p->flow_count == 0 && now >= deadline)

@@ -27,6 +27,12 @@ RUN CGO_CFLAGS= CGO_CPPFLAGS= CGO_CXXFLAGS= CGO_LDFLAGS= \
 
 # All application/native dependency inputs are local; Go cannot download modules
 # or switch toolchains. The SDK's probes execute on the target Linux platform.
+# The release's strict C11 relay probe includes POSIX pthread declarations.
+# Enable glibc's default POSIX interfaces through the Linux compiler invocation;
+# application and pinned dependency sources remain the release's original bytes.
+RUN printf '%s\n' '#!/bin/sh' 'exec gcc -D_DEFAULT_SOURCE "$@"' > /usr/local/bin/oheco-linux-cc \
+    && chmod 0755 /usr/local/bin/oheco-linux-cc
+ENV CC=/usr/local/bin/oheco-linux-cc
 RUN NATIVE_JOBS="${NATIVE_JOBS}" sh sdk/c/build.sh --build-dir /build/sdk
 RUN . /build/sdk/remote-sdk/remote.env \
     && go test -count=1 -timeout=180s ./... \

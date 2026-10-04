@@ -185,6 +185,31 @@ docker compose --env-file deploy/docker/.env.static \
   -f deploy/docker/compose.static.yaml logs --tail=100 broker
 ```
 
+外部证书同样可以使用主机 TCP 443 或其他可用 TCP 端口：改用前述 bridge 发布方式，容器通过独立网络命名空间的 sysctl 绑定 TCP 443，保留静态证书 flags 与只读证书目录。下面是替代 host Compose 部署的完整例子；发布其他 HTTPS 端口时只修改 `443:443/tcp` 中的第一个端口。普通 rootful Docker Engine 发布主机端口，rootless 限制见内置 ACME 段。
+
+```sh
+docker run -d --name oheco-broker-static --restart unless-stopped \
+  --network bridge --user 10001:10001 --read-only \
+  --cap-drop ALL --security-opt no-new-privileges:true \
+  --sysctl net.ipv4.ip_unprivileged_port_start=0 \
+  --publish 443:443/tcp --publish 3478:3478/udp \
+  --publish "${BROKER_RELAY_MIN_PORT:-50000}-${BROKER_RELAY_MAX_PORT:-50100}:${BROKER_RELAY_MIN_PORT:-50000}-${BROKER_RELAY_MAX_PORT:-50100}/udp" \
+  --tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777 \
+  -e XDG_CONFIG_HOME=/var/lib/oheco-broker/config \
+  --mount "type=bind,src=$BROKER_DATA_DIR,dst=/var/lib/oheco-broker" \
+  --mount "type=bind,src=$BROKER_SECRETS_DIR,dst=/run/oheco-broker/secrets,readonly" \
+  --mount "type=bind,src=$BROKER_CERT_DIR,dst=/run/oheco-broker/tls,readonly" \
+  ghcr.io/oheco/oheco-broker:0.3.0 \
+  --listen=0.0.0.0:443 --db=/var/lib/oheco-broker/db/control.sqlite \
+  --admin-token-file=/run/oheco-broker/secrets/admin.token \
+  --registration=approval --registration-relay=false \
+  --tls-cert=/run/oheco-broker/tls/fullchain.pem \
+  --tls-key=/run/oheco-broker/tls/privkey.pem --tls-reload-interval=30s \
+  --turn-listen=0.0.0.0:3478 --turn-public-ip="${BROKER_PUBLIC_IPV4:?set the public IPv4}" \
+  --turn-relay-min-port="${BROKER_RELAY_MIN_PORT:-50000}" \
+  --turn-relay-max-port="${BROKER_RELAY_MAX_PORT:-50100}"
+```
+
 服务每 30 秒读取稳定的证书／密钥快照，校验权限、匹配关系和有效期。成功后新 TLS 握手使用更新证书，已有 WSS 连接继续，**无需容器重启**。文件缺失、部分更新、无效格式、symlink、错误权限或不匹配时保留最后有效 pair，记录 `certificate_reload_error`；恢复后记录 `certificate_reload_recovered`／`certificate_reloaded`。最后有效证书也会到期，不能忽略持续的续期／加载失败。
 
 ## CLI 与管理员操作

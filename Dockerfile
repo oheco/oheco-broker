@@ -42,11 +42,14 @@ RUN . /build/sdk/remote-sdk/remote.env \
 
 # Linux adaptation of test-remote.sh: use the SDK-selected compiler/runtime.
 # Keep the project script and application sources from the release unchanged.
+# GCC's indentation warning on the release's sequential ADD_HEADER macro stays
+# visible; all other diagnostics retain the original -Werror policy.
 RUN . /build/sdk/remote-sdk/remote.env \
     && cmake -S sdk/c/remote -B /build/sdk/remote-sdk \
         -DOB_REMOTE_BUILD_TESTS=ON -DOB_REMOTE_TEST_SOURCE_DIR=/src/tests/c \
     && cmake --build /build/sdk/remote-sdk --parallel "${NATIVE_JOBS}" \
-    && gcc -std=c11 -D_GNU_SOURCE -DJUICE_STATIC -DCURL_STATICLIB -Wall -Wextra -Werror -pthread \
+    && gcc -std=c11 -D_GNU_SOURCE -DJUICE_STATIC -DCURL_STATICLIB -Wall -Wextra -Werror \
+        -Wno-error=misleading-indentation -pthread \
         -Isdk/c/remote -I"${OB_NATIVE_PREFIX}/include" -I"${OB_CURL_PREFIX}/include" \
         sdk/c/remote/ob_api.c sdk/c/remote/ob_json.c tests/c/remote_api_test.c \
         "${OB_CURL_PREFIX}/lib/libcurl.a" "${OB_NATIVE_PREFIX}/lib/libcjson.a" \

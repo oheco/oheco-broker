@@ -254,13 +254,20 @@ func TestAuthRefreshDeviceSameSecretRenewalAndExpiredDenial(t *testing.T) {
 		t.Fatal(err)
 	}
 	authExec(t, f.s, "UPDATE tokens SET expires_at=? WHERE hash=?", now()+10000, tokenHash(f.device))
+	var shortened int64
+	if err := f.s.db.QueryRow("SELECT expires_at FROM tokens WHERE hash=?", tokenHash(f.device)).Scan(&shortened); err != nil || shortened >= original {
+		t.Fatal("device grant was not shortened for renewal", shortened, original, err)
+	}
 	rotateFixture(t, &f)
 	apiCall(t, f.s, "POST", "/v1/brokers/"+f.broker+"/heartbeat", f.device, map[string]any{}, 200)
 	var renewed int64
-	if err := f.s.db.QueryRow("SELECT expires_at FROM tokens WHERE hash=?", tokenHash(f.device)).Scan(&renewed); err != nil || renewed <= original {
-		t.Fatal("same device grant was not renewed", renewed, original, err)
+	if err := f.s.db.QueryRow("SELECT expires_at FROM tokens WHERE hash=?", tokenHash(f.device)).Scan(&renewed); err != nil || renewed <= shortened {
+		t.Fatal("same device grant was not renewed", renewed, shortened, err)
 	}
-	a, _ := readAuthSession(f.s.db, f.credentials.AuthSessionID)
+	a, err := readAuthSession(f.s.db, f.credentials.AuthSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if renewed > a.RefreshExpiry {
 		t.Fatal("device exceeded authority deadline")
 	}

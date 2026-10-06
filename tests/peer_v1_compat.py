@@ -293,8 +293,8 @@ class Fixture:
         self.url = information["api"]
         require(self.url.startswith("http://127.0.0.1:"), "fixture is not private loopback")
         with self.database() as database:
-            require(database.execute("SELECT version FROM schema_version").fetchall() == [(2,)],
-                    "compatibility fixture must run backend schema 2")
+            require(database.execute("SELECT version FROM schema_version").fetchall() == [(3,)],
+                    "compatibility fixture must run backend schema 3")
         return process
 
     def database(self):

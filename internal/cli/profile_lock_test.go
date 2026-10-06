@@ -74,7 +74,7 @@ func TestConcurrentRegistrationDoesNotOverwritePendingRecovery(t *testing.T) {
 	}))
 	defer server.Close()
 	result := make(chan error, 1)
-	command := []string{"--api", server.URL, "--config", path, "tenant", "register"}
+	command := []string{"--api", server.URL, "--config", path, "tenant", "register", "--legacy-auth"}
 	go func() {
 		result <- Execute(context.Background(), command, "test", func(context.Context) error { return nil })
 	}()

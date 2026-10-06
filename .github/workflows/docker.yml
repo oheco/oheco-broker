@@ -9,7 +9,7 @@ on:
       version:
         description: 'Existing application release version (without v)'
         required: true
-        default: '0.4.0'
+        default: '0.5.0'
         type: string
       image_tag:
         description: 'Optional image tag: VERSION or VERSION-docker.N (positive N)'

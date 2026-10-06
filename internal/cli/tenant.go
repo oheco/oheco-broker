@@ -16,8 +16,32 @@ import (
 )
 
 type authResponse struct {
-	Tenant struct{ ID, Name, Email string }
-	Token  string
+	Tenant           struct{ ID, Name, Email string }
+	Token            string    `json:"token"`
+	RefreshToken     string    `json:"refresh_token"`
+	AuthSessionID    string    `json:"auth_session_id"`
+	Generation       uint64    `json:"generation"`
+	TokenExpiresAt   time.Time `json:"token_expires_at"`
+	RefreshExpiresAt time.Time `json:"refresh_expires_at"`
+}
+
+func (r authResponse) credentials() remote.AuthCredentials {
+	return remote.AuthCredentials{AuthSessionID: r.AuthSessionID, Token: r.Token, RefreshToken: r.RefreshToken,
+		Generation: r.Generation, TokenExpiresAt: r.TokenExpiresAt, RefreshExpiresAt: r.RefreshExpiresAt}
+}
+func applyAuthResponse(cfg *config, r authResponse) error {
+	if r.Token == "" || r.Tenant.ID == "" {
+		return errors.New("management server returned incomplete account")
+	}
+	cfg.Account.ID, cfg.Account.Name, cfg.Account.Email = r.Tenant.ID, r.Tenant.Name, r.Tenant.Email
+	cfg.Account.Token = r.Token
+	if r.AuthSessionID != "" {
+		cfg.setAuthCredentials(r.credentials())
+	} else {
+		cfg.Version = 1
+		cfg.Auth = nil
+	}
+	return validateAuthProfile(*cfg)
 }
 
 func tenantCommands(o *rootOptions) *cobra.Command {
@@ -34,16 +58,47 @@ func tenantCommands(o *rootOptions) *cobra.Command {
 			return err
 		}
 		defer client.Close()
-		_, err = client.Request("POST", "/v1/tenants/logout", nil, map[string]any{})
+		endpoint := "/v1/tenants/logout"
+		if cfg.Auth != nil {
+			endpoint = "/v1/auth/logout"
+		}
+		_, err = client.Request("POST", endpoint, nil, map[string]any{})
 		if err != nil {
 			return err
 		}
+		if err = client.Close(); err != nil {
+			return err
+		}
 		cfg.Account.Token = ""
-		return saveConfig(path, cfg)
+		cfg.Auth = nil
+		if err = saveConfig(path, cfg); err != nil {
+			return err
+		}
+		return removePrivatePending(path + ".refresh-pending")
 	}})
 	accountCmd := &cobra.Command{Use: "account", Short: "Account information and credentials"}
 	accountCmd.AddCommand(accountShow(o), accountUpdate(o), accountPassword(o))
 	tenant.AddCommand(accountCmd)
+	tenant.AddCommand(&cobra.Command{Use: "refresh", Args: cobra.NoArgs, Short: "Refresh login credentials without restarting peers", RunE: func(cmd *cobra.Command, _ []string) error {
+		client, cfg, _, err := o.newClient(true)
+		if err != nil {
+			return err
+		}
+		defer client.Close()
+		if cfg.Auth == nil {
+			return errors.New("this profile uses a static token; login to enable automatic refresh")
+		}
+		if err = client.RefreshAuth(); err != nil {
+			return err
+		}
+		credentials, err := client.AuthCredentials()
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]any{"auth_session_id": credentials.AuthSessionID,
+			"generation": credentials.Generation, "token_expires_at": credentials.TokenExpiresAt,
+			"refresh_expires_at": credentials.RefreshExpiresAt})
+	}})
 	tenant.AddCommand(tenantRequest(o, "capabilities", "/v1/capabilities"), tenantUsage(o))
 	brokers := &cobra.Command{Use: "broker", Short: "Broker metadata"}
 	brokers.AddCommand(tenantRequest(o, "list", "/v1/brokers"))
@@ -87,7 +142,7 @@ func tenantCommands(o *rootOptions) *cobra.Command {
 }
 func registration(o *rootOptions, login bool) *cobra.Command {
 	var name, password, email string
-	var passwordStdin, replace bool
+	var passwordStdin, replace, legacyAuth bool
 	verb := "register"
 	if login {
 		verb = "login"
@@ -119,6 +174,13 @@ func registration(o *rootOptions, login bool) *cobra.Command {
 			return err
 		}
 		defer client.Close()
+		refreshEnabled := false
+		if !legacyAuth {
+			refreshEnabled, err = supportsAuthRefresh(client)
+			if err != nil {
+				return err
+			}
+		}
 		if login {
 			if name == "" {
 				name = previous.Account.Name
@@ -138,7 +200,9 @@ func registration(o *rootOptions, login bool) *cobra.Command {
 			if name == "" {
 				name = generatedName
 			}
-			if passwordStdin {
+			if refreshEnabled {
+				password, err = readPassword(cmd, password, passwordStdin, "Account password")
+			} else if passwordStdin {
 				password, err = readPassword(cmd, password, true, "")
 			} else if password == "" {
 				password = generatedPassword
@@ -165,7 +229,11 @@ func registration(o *rootOptions, login bool) *cobra.Command {
 			}
 		}
 		empty := ""
-		raw, err := client.Request("POST", "/v1/tenants/"+verb, &empty, body)
+		endpoint := "/v1/tenants/" + verb
+		if refreshEnabled {
+			endpoint = "/v1/auth/" + verb
+		}
+		raw, err := client.Request("POST", endpoint, &empty, body)
 		if err != nil {
 			if pendingPath != "" {
 				return fmt.Errorf("%w; registration outcome may need checking, credentials retained privately in %s", err, pendingPath)
@@ -179,15 +247,24 @@ func registration(o *rootOptions, login bool) *cobra.Command {
 		if response.Token == "" || response.Tenant.ID == "" {
 			return errors.New("management server returned incomplete account")
 		}
-		cfg := config{Version: 1, API: api, CAFile: ca, Account: account{ID: response.Tenant.ID, Name: response.Tenant.Name, Password: password, Email: response.Tenant.Email, Token: response.Token}}
+		cfg := config{Version: 1, API: api, CAFile: ca, Account: account{Password: password}}
+		if err = applyAuthResponse(&cfg, response); err != nil {
+			return err
+		}
+		if refreshEnabled && cfg.Auth == nil {
+			return errors.New("server omitted refresh credentials")
+		}
 		if err = saveConfig(path, cfg); err != nil {
 			if pendingPath != "" {
 				return fmt.Errorf("account operation succeeded but configuration save failed; pending credentials at %s can recover login: %w", pendingPath, err)
 			}
 			return fmt.Errorf("login succeeded but configuration save failed; retry login to persist it: %w", err)
 		}
+		if err = removePrivatePending(path + ".refresh-pending"); err != nil {
+			return err
+		}
 		if pendingPath != "" {
-			if err = os.Remove(pendingPath); err != nil {
+			if err = removePrivatePending(pendingPath); err != nil {
 				return fmt.Errorf("account saved but pending credential cleanup failed: %w", err)
 			}
 		}
@@ -196,6 +273,7 @@ func registration(o *rootOptions, login bool) *cobra.Command {
 	command.Flags().StringVar(&name, "name", "", "Tenant name (register: generated when omitted)")
 	command.Flags().StringVar(&password, "password", "", "Account password (prefer --password-stdin)")
 	command.Flags().BoolVar(&passwordStdin, "password-stdin", false, "Read account password from stdin")
+	command.Flags().BoolVar(&legacyAuth, "legacy-auth", false, "Use a static account token and a version1 profile for older clients")
 	if !login {
 		command.Flags().StringVar(&email, "email", "", "Optional contact email")
 		command.Flags().BoolVar(&replace, "replace", false, "Explicitly replace this local account profile")
@@ -269,10 +347,16 @@ func accountUpdate(o *rootOptions) *cobra.Command {
 		if err = json.Unmarshal(raw, &response); err != nil {
 			return err
 		}
-		cfg.Account.Name = response.Tenant.Name
-		cfg.Account.Email = response.Tenant.Email
-		cfg.Account.Token = response.Token
+		if err = client.Close(); err != nil {
+			return err
+		}
+		if err = applyAuthResponse(&cfg, response); err != nil {
+			return err
+		}
 		if err = saveConfig(path, cfg); err != nil {
+			return err
+		}
+		if err = removePrivatePending(path + ".refresh-pending"); err != nil {
 			return err
 		}
 		return printJSON(cmd, raw)
@@ -307,9 +391,20 @@ func accountPassword(o *rootOptions) *cobra.Command {
 		if err = json.Unmarshal(raw, &response); err != nil {
 			return err
 		}
+		if err = client.Close(); err != nil {
+			return err
+		}
+		if response.Tenant.ID == "" {
+			response.Tenant.ID, response.Tenant.Name, response.Tenant.Email = cfg.Account.ID, cfg.Account.Name, cfg.Account.Email
+		}
 		cfg.Account.Password = pw
-		cfg.Account.Token = response.Token
+		if err = applyAuthResponse(&cfg, response); err != nil {
+			return err
+		}
 		if err = saveConfig(path, cfg); err != nil {
+			return err
+		}
+		if err = removePrivatePending(path + ".refresh-pending"); err != nil {
 			return err
 		}
 		return printJSON(cmd, raw)

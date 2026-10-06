@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the 0.4.0 native release from a clean committed snapshot, offline.
+"""Build the 0.5.0 native release from a clean committed snapshot, offline.
 
 All native dependencies, the peer SDK, CLI and standalone server are rebuilt in
 fresh private TMPDIR directories. SDKs are shipped as complete source trees;
@@ -21,9 +21,9 @@ import tarfile
 import tempfile
 
 
-RELEASE_VERSION = "0.4.0"
+RELEASE_VERSION = "0.5.0"
 SOURCE_FILES = {name: name for name in (
-    "LICENSE", "protocol/PROTOCOL.md", "docs/RECONNECT.md", "go.mod", "go.sum",
+    "LICENSE", "protocol/PROTOCOL.md", "docs/RECONNECT.md", "docs/AUTH-REFRESH.md", "go.mod", "go.sum",
 )}
 SOURCE_FILES["README.md"] = "docs/PACKAGE-README.md"
 SOURCE_TREES = ("sdk/c", "sdk/go", "sdk/dotnet", "vendor", "vendor-manifests")
@@ -248,7 +248,7 @@ def main():
                                     ("cmd/oheco-broker-server/main.go", "Version")):
             text = (source / filename).read_text(encoding="utf-8")
             if not re.search(r'^const ' + spelling + ' = "' + re.escape(RELEASE_VERSION) + '"$', text, re.M):
-                raise RuntimeError(f"Committed {filename} must declare formal version 0.4.0")
+                raise RuntimeError(f"Committed {filename} must declare formal version 0.5.0")
         env = {key: value for key, value in os.environ.items()
                if not key.startswith(("CGO_", "OB_", "NATIVE_", "CURL_")) and
                key not in {"LD_PRELOAD", "LD_LIBRARY_PATH", "GOFLAGS", "GOENV", "GOWORK"}}

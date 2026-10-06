@@ -485,8 +485,18 @@ func TestConnectionScopeBoundsAndUsedSecrets(t *testing.T) {
 		t.Fatal(err)
 	}
 	var count int
+	if err := f.s.db.QueryRow("SELECT COUNT(*) FROM connections").Scan(&count); err != nil || count != 1 {
+		t.Fatal("lost creation retries still require the revoked ID tombstone", count, err)
+	}
+	connectionOpen(t, f, id, body, 403)
+	if _, err := f.s.db.Exec("UPDATE tokens SET expires_at=0 WHERE hash=?", tokenHash(f.account)); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.pruneConnections(); err != nil {
+		t.Fatal(err)
+	}
 	if err := f.s.db.QueryRow("SELECT COUNT(*) FROM connections").Scan(&count); err != nil || count != 0 {
-		t.Fatal(count, err)
+		t.Fatal("dead caller authority should release tombstones", count, err)
 	}
 }
 
@@ -566,7 +576,7 @@ func TestConnectionSchemaMigrationPersistsLegacyData(t *testing.T) {
 		t.Fatal(err)
 	}
 	var version int
-	if err := f.s.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 2 {
+	if err := f.s.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 3 {
 		t.Fatal(version, err)
 	}
 	apiCall(t, f.s, "GET", "/v1/brokers/"+f.broker, f.account, nil, 200)

@@ -261,7 +261,7 @@ class Smoke:
         settings = self.api("GET", "/v1/admin/settings", token=self.admin)
         require(settings == {"registration_policy": "approval", "registration_relay_enabled": False}, "unsafe initial registration defaults")
         info = self.api("GET", "/v1/admin/info", token=self.admin)
-        expected_schema = 2 if tuple(map(int, self.args.expected_version.split("."))) >= (0, 4, 0) else 1
+        expected_schema = 3 if tuple(map(int, self.args.expected_version.split("."))) >= (0, 5, 0) else (2 if tuple(map(int, self.args.expected_version.split("."))) >= (0, 4, 0) else 1)
         require(info["storage"] == "sqlite3" and info["schema_version"] == expected_schema and info["quic_termination"] is False, "not the SQLite standalone service")
         untrusted = self.docker("exec", server, "oheco-broker", "--api", self.api_url, "admin", "--token-file",
                                 SECRETS + "/admin.token", "info", check=False)
@@ -269,7 +269,7 @@ class Smoke:
         trusted = self.docker("run", "--rm", *self.options(trust=True), "--entrypoint", "oheco-broker", self.args.image,
                               "--api", self.api_url, "admin", "--token-file", SECRETS + "/admin.token", "info")
         require(json.loads(trusted.stdout)["storage"] == "sqlite3", "C SDK default CA trust path did not verify HTTPS")
-        registered = self.cli_json(server, "tenant", "register", "--email", "docker-smoke@example.invalid")
+        registered = self.cli_json(server, "tenant", "register", "--legacy-auth", "--email", "docker-smoke@example.invalid")
         self.tenant = registered["tenant"]["id"]
         require(registered["tenant"]["status"] == "pending" and registered["tenant"]["relay_enabled"] is False,
                 "new account bypassed approval/relay defaults")
@@ -521,7 +521,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", required=True)
     parser.add_argument("--expected-arch", choices=("amd64", "arm64"), required=True)
-    parser.add_argument("--expected-version", default="0.4.0")
+    parser.add_argument("--expected-version", default="0.5.0")
     parser.add_argument("--expected-revision", required=True)
     args = parser.parse_args()
     require(platform.system() == "Linux" and architecture(platform.machine()) == args.expected_arch,

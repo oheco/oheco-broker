@@ -15,6 +15,7 @@ import (
 type connectionRecord struct {
 	ID, Tenant, Broker, Relay, AccountHash, DeviceHash string
 	Session, Request, TokenHash, Revoked               string
+	AuthSession                                        string
 	Version                                            int
 	Generation, PriorGeneration                        uint64
 }
@@ -54,13 +55,29 @@ func connectionFailure(status int, code, message string, generation uint64) erro
 }
 func readConnection(q interface{ QueryRow(string, ...any) *sql.Row }, id string) (connectionRecord, error) {
 	var c connectionRecord
-	err := q.QueryRow("SELECT id,tenant_id,broker_id,relay_mode,account_hash,device_hash,tenant_version,generation,current_session_id,request_id,prior_generation,session_token_hash,revoked_reason FROM connections WHERE id=?", id).Scan(&c.ID, &c.Tenant, &c.Broker, &c.Relay, &c.AccountHash, &c.DeviceHash, &c.Version, &c.Generation, &c.Session, &c.Request, &c.PriorGeneration, &c.TokenHash, &c.Revoked)
+	err := q.QueryRow("SELECT id,tenant_id,broker_id,relay_mode,account_hash,device_hash,tenant_version,generation,current_session_id,request_id,prior_generation,session_token_hash,revoked_reason,COALESCE(auth_session_id,'') FROM connections WHERE id=?", id).Scan(&c.ID, &c.Tenant, &c.Broker, &c.Relay, &c.AccountHash, &c.DeviceHash, &c.Version, &c.Generation, &c.Session, &c.Request, &c.PriorGeneration, &c.TokenHash, &c.Revoked, &c.AuthSession)
 	return c, err
 }
-func connectionCredential(q interface{ QueryRow(string, ...any) *sql.Row }, hash, kind, tenant, broker string, version int) (bool, error) {
-	var count int
-	err := q.QueryRow("SELECT COUNT(*) FROM tokens WHERE hash=? AND kind=? AND tenant_id=? AND version=? AND expires_at>? AND COALESCE(broker_id,'')=?", hash, kind, tenant, version, now(), broker).Scan(&count)
-	return count == 1, err
+func connectionCredential(q authQuerier, hash, kind, tenant, broker string, version int) (bool, error) {
+	var authID string
+	err := q.QueryRow("SELECT COALESCE(auth_session_id,'') FROM tokens WHERE hash=? AND kind=? AND tenant_id=? AND version=? AND expires_at>? AND COALESCE(broker_id,'')=?", hash, kind, tenant, version, now(), broker).Scan(&authID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if authID != "" {
+		_, err = authAuthority(q, authID, tenant, version, false)
+		if err != nil {
+			var api *apiError
+			if errors.As(err, &api) {
+				return false, nil
+			}
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 type observedSessionRevocation struct {
@@ -108,7 +125,19 @@ func checkConnection(q interface{ QueryRow(string, ...any) *sql.Row }, c connect
 	if errors.Is(err, sql.ErrNoRows) || version != c.Version || status != "active" {
 		return connectionFailure(403, "credential_revoked", "connection identity is no longer authorized", c.Generation)
 	}
-	account, err := connectionCredential(q, c.AccountHash, "account", c.Tenant, "", c.Version)
+	var account bool
+	if c.AuthSession != "" {
+		_, authorityErr := authAuthority(q, c.AuthSession, c.Tenant, c.Version, false)
+		if authorityErr != nil {
+			var api *apiError
+			if !errors.As(authorityErr, &api) {
+				return authorityErr
+			}
+		}
+		account = authorityErr == nil
+	} else {
+		account, err = connectionCredential(q, c.AccountHash, "account", c.Tenant, "", c.Version)
+	}
 	if err != nil {
 		return err
 	}
@@ -233,7 +262,7 @@ func (s *Server) connectionSession(w http.ResponseWriter, r *http.Request) error
 		return connectionFailure(404, "connection_unknown", "connection lineage is unavailable", 0)
 	}
 	if !fresh {
-		if c.Tenant != p.tenant || c.Broker != body.Broker || c.Relay != body.Relay || c.AccountHash != tokenHash(bearer(r)) {
+		if c.Tenant != p.tenant || c.Broker != body.Broker || c.Relay != body.Relay || (c.AuthSession == "" && c.AccountHash != tokenHash(bearer(r)) || c.AuthSession != "" && c.AuthSession != p.authSession) {
 			return connectionFailure(403, "connection_revoked", "connection scope or credential changed", c.Generation)
 		}
 		if err = checkConnection(tx, c); err != nil {
@@ -303,6 +332,7 @@ func (s *Server) connectionSession(w http.ResponseWriter, r *http.Request) error
 			return err
 		}
 		c.AccountHash = tokenHash(bearer(r))
+		c.AuthSession = p.authSession
 		c.Version = p.version
 	}
 	if err = tx.QueryRow("SELECT COUNT(*) FROM sessions WHERE tenant_id=? AND expires_at>? AND id<>?", p.tenant, now(), c.Session).Scan(&count); err != nil {
@@ -348,14 +378,14 @@ func (s *Server) connectionSession(w http.ResponseWriter, r *http.Request) error
 	generation := c.Generation + 1
 	sid := uuid()
 	expiry := time.Now().Add(s.cfg.SessionTTL)
-	if _, err = tx.Exec("INSERT INTO sessions(id,tenant_id,broker_id,relay_mode,expires_at) VALUES(?,?,?,?,?)", sid, p.tenant, body.Broker, body.Relay, timestamp(expiry)); err != nil {
+	if _, err = tx.Exec("INSERT INTO sessions(id,tenant_id,broker_id,relay_mode,expires_at,auth_session_id) VALUES(?,?,?,?,?,?)", sid, p.tenant, body.Broker, body.Relay, timestamp(expiry), nullAuthSession(p.authSession)); err != nil {
 		return err
 	}
-	if _, err = tx.Exec("INSERT INTO tokens(hash,kind,tenant_id,broker_id,session_id,version,expires_at) VALUES(?,'session',?,?,?,?,?)", tokenHash(body.Token), p.tenant, body.Broker, sid, p.version, timestamp(expiry)); err != nil {
+	if _, err = tx.Exec("INSERT INTO tokens(hash,kind,tenant_id,broker_id,session_id,version,expires_at,auth_session_id) VALUES(?,'session',?,?,?,?,?,?)", tokenHash(body.Token), p.tenant, body.Broker, sid, p.version, timestamp(expiry), nullAuthSession(p.authSession)); err != nil {
 		return err
 	}
 	if fresh {
-		_, err = tx.Exec("INSERT INTO connections(id,tenant_id,broker_id,relay_mode,account_hash,device_hash,tenant_version,generation,current_session_id,request_id,prior_generation,session_token_hash,revoked_reason,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'',?,?)", id, p.tenant, body.Broker, body.Relay, c.AccountHash, c.DeviceHash, c.Version, generation, sid, body.Request, *body.ExpectedGeneration, tokenHash(body.Token), now(), now())
+		_, err = tx.Exec("INSERT INTO connections(id,tenant_id,broker_id,relay_mode,account_hash,device_hash,tenant_version,generation,current_session_id,request_id,prior_generation,session_token_hash,revoked_reason,created_at,updated_at,auth_session_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'',?,?,?)", id, p.tenant, body.Broker, body.Relay, c.AccountHash, c.DeviceHash, c.Version, generation, sid, body.Request, *body.ExpectedGeneration, tokenHash(body.Token), now(), now(), nullAuthSession(c.AuthSession))
 	} else {
 		_, err = tx.Exec("UPDATE connections SET generation=?,current_session_id=?,request_id=?,prior_generation=?,session_token_hash=?,updated_at=? WHERE id=?", generation, sid, body.Request, *body.ExpectedGeneration, tokenHash(body.Token), now(), id)
 	}
@@ -468,7 +498,7 @@ func (s *Server) deleteSessionLineage(r *http.Request) (bool, error) {
 }
 
 func (s *Server) connectionDiscovery(w http.ResponseWriter, r *http.Request) error {
-	s.write(w, 200, map[string]any{"connection_recovery_version": 1, "connection_recovery_protocol": "connections-v1", "signaling": wsProtocol})
+	s.write(w, 200, map[string]any{"account_refresh_protocol": "refresh-v1", "connection_recovery_version": 1, "connection_recovery_protocol": "connections-v1", "signaling": wsProtocol})
 	return nil
 }
 
@@ -478,8 +508,15 @@ func (s *Server) pruneConnections() error {
 		return err
 	}
 	defer tx.Rollback()
-	dead := "NOT EXISTS(SELECT 1 FROM tokens WHERE tokens.hash=connections.account_hash AND tokens.kind='account' AND tokens.expires_at>?) OR NOT EXISTS(SELECT 1 FROM tokens WHERE tokens.hash=connections.device_hash AND tokens.kind='device' AND tokens.expires_at>?) OR NOT EXISTS(SELECT 1 FROM tenants WHERE tenants.id=connections.tenant_id AND tenants.version=connections.tenant_version AND tenants.status='active')"
-	ids := "SELECT session_id FROM connection_sessions WHERE connection_id IN (SELECT id FROM connections WHERE " + dead + ")"
+	// A missing/replaced device retires a connection, but cannot erase its ID
+	// while the original caller can replay a lost initial creation request.
+	deviceDead := "NOT EXISTS(SELECT 1 FROM tokens d LEFT JOIN auth_sessions da ON da.id=d.auth_session_id WHERE d.hash=connections.device_hash AND d.kind='device' AND d.expires_at>? AND (d.auth_session_id IS NULL OR da.revoked_reason='' AND da.refresh_expires_at>? AND da.version=connections.tenant_version))"
+	retired, err := tx.Exec("UPDATE connections SET revoked_reason='credential_revoked',updated_at=? WHERE revoked_reason='' AND "+deviceDead, now(), now(), now())
+	if err != nil {
+		return err
+	}
+	dead := "(connections.auth_session_id IS NULL AND NOT EXISTS(SELECT 1 FROM tokens WHERE tokens.hash=connections.account_hash AND tokens.kind='account' AND tokens.expires_at>?)) OR (connections.auth_session_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM auth_sessions a WHERE a.id=connections.auth_session_id AND a.tenant_id=connections.tenant_id AND a.version=connections.tenant_version AND a.revoked_reason='' AND a.refresh_expires_at>?)) OR NOT EXISTS(SELECT 1 FROM tenants WHERE tenants.id=connections.tenant_id AND tenants.version=connections.tenant_version AND tenants.status='active')"
+	ids := "SELECT session_id FROM connection_sessions WHERE connection_id IN (SELECT id FROM connections WHERE revoked_reason<>'' OR " + dead + ")"
 	if _, err = tx.Exec("DELETE FROM tokens WHERE kind='session' AND session_id IN ("+ids+")", now(), now()); err != nil {
 		return err
 	}
@@ -493,7 +530,9 @@ func (s *Server) pruneConnections() error {
 	if err = tx.Commit(); err != nil {
 		return err
 	}
-	if count, _ := result.RowsAffected(); count != 0 {
+	count, _ := result.RowsAffected()
+	retiredCount, _ := retired.RowsAffected()
+	if count != 0 || retiredCount != 0 {
 		s.ws.wake(func(*wsPeer) bool { return true })
 	}
 	return nil

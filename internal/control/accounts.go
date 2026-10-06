@@ -12,6 +12,11 @@ import (
 )
 
 func (s *Server) routes() {
+	s.mux.HandleFunc("POST /v1/auth/register", s.endpoint(s.registerAuth))
+	s.mux.HandleFunc("POST /v1/auth/login", s.endpoint(s.loginAuth))
+	s.mux.HandleFunc("POST /v1/auth/refresh", s.endpoint(s.refreshAuth))
+	s.mux.HandleFunc("POST /v1/auth/logout", s.endpoint(s.logoutAuth))
+	s.mux.HandleFunc("DELETE /v1/auth/sessions/{id}", s.endpoint(s.deleteAuthSession))
 	s.mux.HandleFunc("GET /v1/status", s.endpoint(s.connectionDiscovery))
 	s.mux.HandleFunc("POST /v1/connections/{id}/session", s.endpoint(s.connectionSession))
 	s.mux.HandleFunc("DELETE /v1/connections/{id}", s.endpoint(s.deleteConnection))
@@ -82,6 +87,12 @@ func readRegistrationSettings(q interface {
 }
 
 func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
+	return s.registerAccount(w, r, false)
+}
+func (s *Server) registerAuth(w http.ResponseWriter, r *http.Request) error {
+	return s.registerAccount(w, r, true)
+}
+func (s *Server) registerAccount(w http.ResponseWriter, r *http.Request, refreshed bool) error {
 	settings, e := readRegistrationSettings(s.db)
 	if e != nil {
 		return e
@@ -135,7 +146,14 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
 	if _, e = tx.Exec("INSERT INTO tenants(id,name,email,password_hash,status,relay_enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)", id, b.Name, b.Email, hash, status, boolInt(settings.RelayEnabled), n, n); e != nil {
 		return e
 	}
-	token, e := issue(tx, "account", id, "", "", 1, time.Now().Add(s.cfg.AccountTokenTTL))
+	var token string
+	var credentials authCredentials
+	if refreshed {
+		credentials, e = s.issueAuthSession(tx, id, 1)
+		token = credentials.Token
+	} else {
+		token, e = issue(tx, "account", id, "", "", 1, time.Now().Add(s.cfg.AccountTokenTTL))
+	}
 	if e != nil {
 		return e
 	}
@@ -146,10 +164,20 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) error {
 	if e != nil {
 		return e
 	}
-	s.write(w, 201, map[string]any{"tenant": t, "token": token})
+	if refreshed {
+		s.write(w, 201, authResponse(t, credentials))
+	} else {
+		s.write(w, 201, map[string]any{"tenant": t, "token": token})
+	}
 	return nil
 }
 func (s *Server) login(w http.ResponseWriter, r *http.Request) error {
+	return s.loginAccount(w, r, false)
+}
+func (s *Server) loginAuth(w http.ResponseWriter, r *http.Request) error {
+	return s.loginAccount(w, r, true)
+}
+func (s *Server) loginAccount(w http.ResponseWriter, r *http.Request, refreshed bool) error {
 	var b struct {
 		Name     string `json:"name"`
 		Password string `json:"password"`
@@ -173,11 +201,36 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) error {
 		return fail(403, "tenant is not active")
 	}
 	// Account sessions are bounded. Oldest expiry is evicted only at the limit.
-	_, e = s.db.Exec("DELETE FROM tokens WHERE hash IN (SELECT hash FROM tokens WHERE tenant_id=? AND kind='account' ORDER BY expires_at ASC LIMIT MAX(0,(SELECT COUNT(*) FROM tokens WHERE tenant_id=? AND kind='account')-15))", id, id)
-	if e != nil {
-		return e
+	if !refreshed {
+		_, e = s.db.Exec("DELETE FROM tokens WHERE hash IN (SELECT hash FROM tokens WHERE tenant_id=? AND kind='account' AND auth_session_id IS NULL ORDER BY expires_at ASC LIMIT MAX(0,(SELECT COUNT(*) FROM tokens WHERE tenant_id=? AND kind='account' AND auth_session_id IS NULL)-15))", id, id)
+		if e != nil {
+			return e
+		}
 	}
-	token, e := s.accountToken(id, version)
+	var token string
+	var credentials authCredentials
+	if refreshed {
+		tx, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		var liveHash, liveStatus string
+		var liveVersion int
+		if err = tx.QueryRow("SELECT password_hash,status,version FROM tenants WHERE id=?", id).Scan(&liveHash, &liveStatus, &liveVersion); err != nil {
+			return err
+		}
+		if liveHash != hash || liveStatus != "active" || liveVersion != version {
+			return fail(401, "invalid login")
+		}
+		credentials, e = s.issueAuthSession(tx, id, version)
+		token = credentials.Token
+		if e == nil {
+			e = tx.Commit()
+		}
+	} else {
+		token, e = s.accountToken(id, version)
+	}
 	if e != nil {
 		return e
 	}
@@ -185,7 +238,11 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) error {
 	if e != nil {
 		return e
 	}
-	s.write(w, 200, map[string]any{"tenant": t, "token": token})
+	if refreshed {
+		s.write(w, 200, authResponse(t, credentials))
+	} else {
+		s.write(w, 200, map[string]any{"tenant": t, "token": token})
+	}
 	return nil
 }
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) error {
@@ -199,6 +256,27 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) error {
 	}
 	defer tx.Rollback()
 	hash := tokenHash(token)
+	var authID string
+	e = tx.QueryRow("SELECT COALESCE(auth_session_id,'') FROM tokens WHERE hash=? AND kind='account'", hash).Scan(&authID)
+	if e != nil && !errors.Is(e, sql.ErrNoRows) {
+		return e
+	}
+	if authID != "" {
+		a, err := readAuthSession(tx, authID)
+		if err != nil {
+			return err
+		}
+		v, err := revokeAuthSession(tx, a)
+		if err != nil {
+			return err
+		}
+		if err = tx.Commit(); err != nil {
+			return err
+		}
+		s.applyAuthRevocation(v)
+		s.write(w, 200, map[string]any{"logged_out": true})
+		return nil
+	}
 	if e = revokeConnections(tx, "account_hash=?", "account_logout", hash); e != nil {
 		return e
 	}
@@ -271,7 +349,7 @@ func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) error {
 	if !validName(t.Name) || !validEmail(t.Email) {
 		return fail(400, "invalid name or email")
 	}
-	token, e := s.updateAccount(t, nil, true, p.version, false, false)
+	credentials, e := s.updateAccountCredentials(t, nil, true, p.version, false, false, p.authSession)
 	if e != nil {
 		return e
 	}
@@ -279,7 +357,11 @@ func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) error {
 	if e != nil {
 		return e
 	}
-	s.write(w, 200, map[string]any{"tenant": t, "token": token})
+	if p.authSession != "" {
+		s.write(w, 200, authResponse(t, credentials))
+	} else {
+		s.write(w, 200, map[string]any{"tenant": t, "token": credentials.Token})
+	}
 	return nil
 }
 func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) error {
@@ -301,25 +383,43 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) error {
 	if e != nil {
 		return e
 	}
-	token, e := s.updateAccount(t, &h, true, p.version, false, false)
+	credentials, e := s.updateAccountCredentials(t, &h, true, p.version, false, false, p.authSession)
 	if e != nil {
 		return e
 	}
-	s.write(w, 200, map[string]any{"token": token})
+	if p.authSession != "" {
+		t, _, e = s.tenant(t.ID)
+		if e != nil {
+			return e
+		}
+		s.write(w, 200, authResponse(t, credentials))
+	} else {
+		s.write(w, 200, map[string]any{"token": credentials.Token})
+	}
 	return nil
 }
 
 // Account changes are one atomic version bump + token deletion + replacement token.
 func (s *Server) updateAccount(t Tenant, hash *string, replacement bool, expectedVersion int, updateStatus, updateRelay bool) (string, error) {
+	c, e := s.updateAccountCredentials(t, hash, replacement, expectedVersion, updateStatus, updateRelay, "")
+	return c.Token, e
+}
+func (s *Server) updateAccountCredentials(t Tenant, hash *string, replacement bool, expectedVersion int, updateStatus, updateRelay bool, authority string) (authCredentials, error) {
+	var credentials authCredentials
 	tx, e := s.db.Begin()
 	if e != nil {
-		return "", e
+		return credentials, e
 	}
 	defer tx.Rollback()
+	if authority != "" {
+		if _, e = authAuthority(tx, authority, t.ID, expectedVersion, false); e != nil {
+			return credentials, e
+		}
+	}
 	var v, relay int
 	var status string
 	if e = tx.QueryRow("SELECT version,status,relay_enabled FROM tenants WHERE id=?", t.ID).Scan(&v, &status, &relay); e != nil {
-		return "", e
+		return credentials, e
 	}
 	if !updateStatus {
 		t.Status = status
@@ -329,49 +429,55 @@ func (s *Server) updateAccount(t Tenant, hash *string, replacement bool, expecte
 	}
 	if expectedVersion >= 0 && v != expectedVersion {
 		if !replacement {
-			return "", fail(409, "tenant concurrently changed")
+			return credentials, fail(409, "tenant concurrently changed")
 		}
-		return "", fail(401, "revoked bearer")
+		return credentials, fail(401, "revoked bearer")
 	}
 	var conflict int
 	if e = tx.QueryRow("SELECT COUNT(*) FROM tenants WHERE name=? AND id<>?", t.Name, t.ID).Scan(&conflict); e != nil {
-		return "", e
+		return credentials, e
 	}
 	if conflict != 0 {
-		return "", fail(409, "name already exists")
+		return credentials, fail(409, "name already exists")
 	}
 	if _, e = tx.Exec("UPDATE tenants SET name=?,email=?,status=?,relay_enabled=?,version=version+1,updated_at=? WHERE id=?", t.Name, t.Email, t.Status, boolInt(t.RelayEnabled), now(), t.ID); e != nil {
-		return "", e
+		return credentials, e
 	}
 	if hash != nil {
 		if _, e = tx.Exec("UPDATE tenants SET password_hash=? WHERE id=?", *hash, t.ID); e != nil {
-			return "", e
+			return credentials, e
 		}
 	}
 	if e = revokeConnections(tx, "tenant_id=?", "tenant_reset", t.ID); e != nil {
-		return "", e
+		return credentials, e
+	}
+	if _, e = tx.Exec("UPDATE auth_sessions SET revoked_reason='tenant_reset',updated_at=? WHERE tenant_id=?", now(), t.ID); e != nil {
+		return credentials, e
 	}
 	if _, e = tx.Exec("DELETE FROM tokens WHERE tenant_id=?", t.ID); e != nil {
-		return "", e
+		return credentials, e
 	}
 	if _, e = tx.Exec("DELETE FROM sessions WHERE tenant_id=?", t.ID); e != nil {
-		return "", e
+		return credentials, e
 	}
 	if _, e = tx.Exec("UPDATE brokers SET lease_expires_at=0 WHERE tenant_id=?", t.ID); e != nil {
-		return "", e
+		return credentials, e
 	}
-	token := ""
 	if replacement {
-		token, e = issue(tx, "account", t.ID, "", "", v+1, time.Now().Add(s.cfg.AccountTokenTTL))
+		if authority != "" {
+			credentials, e = s.issueAuthSession(tx, t.ID, v+1)
+		} else {
+			credentials.Token, e = issue(tx, "account", t.ID, "", "", v+1, time.Now().Add(s.cfg.AccountTokenTTL))
+		}
 		if e != nil {
-			return "", e
+			return credentials, e
 		}
 	}
 	if e = tx.Commit(); e != nil {
-		return "", e
+		return credentials, e
 	}
 	s.revokeTenant(t.ID)
-	return token, nil
+	return credentials, nil
 }
 func adminPage(r *http.Request) (limit, offset int, err error) {
 	limit = 100
@@ -708,7 +814,7 @@ func (s *Server) adminInfo(w http.ResponseWriter, r *http.Request) error {
 		}
 		counts[table] = n
 	}
-	s.write(w, 200, map[string]any{"schema_version": 2, "listen_addr": s.cfg.ListenAddr, "turn_addr": s.TURNAddr(), "counts": counts, "signaling": wsProtocol, "storage": "sqlite3", "quic_termination": false})
+	s.write(w, 200, map[string]any{"schema_version": 3, "account_refresh_protocol": "refresh-v1", "listen_addr": s.cfg.ListenAddr, "turn_addr": s.TURNAddr(), "counts": counts, "signaling": wsProtocol, "storage": "sqlite3", "quic_termination": false})
 	return nil
 }
 func (s *Server) myUsage(w http.ResponseWriter, r *http.Request) error {

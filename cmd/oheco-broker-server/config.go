@@ -35,6 +35,10 @@ type Config struct {
 	TLSCertFile              string
 	TLSKeyFile               string
 	TLSReloadInterval        time.Duration
+	AccountTokenTTL          time.Duration
+	AuthRefreshTTL           time.Duration
+	AuthAbsoluteTTL          time.Duration
+	AuthAccessOverlap        time.Duration
 	ACMEDomain               string
 	ACMEEmail                string
 	ACMECacheDir             string
@@ -47,6 +51,7 @@ func DefaultConfig() Config {
 		ListenAddr:         "127.0.0.1:8080",
 		DBPath:             "control.sqlite",
 		RegistrationPolicy: "approval",
+		AccountTokenTTL:    24 * time.Hour, AuthRefreshTTL: 30 * 24 * time.Hour, AuthAccessOverlap: 2 * time.Minute,
 	}
 }
 
@@ -61,6 +66,9 @@ type validatedConfig struct {
 // started; a hostname cannot evade the plaintext/loopback policy through DNS.
 func validate(cfg Config) (validatedConfig, error) {
 	var v validatedConfig
+	if cfg.AccountTokenTTL < 0 || cfg.AuthRefreshTTL < 0 || cfg.AuthAbsoluteTTL < 0 || cfg.AuthAccessOverlap < 0 {
+		return v, errors.New("authentication lifetimes cannot be negative")
+	}
 	if cfg.DBPath == "" || strings.ContainsAny(cfg.DBPath, "?\x00") || strings.HasPrefix(cfg.DBPath, "file:") {
 		return v, errors.New("--db must be a nonempty plain SQLite filesystem path (or :memory:)")
 	}
@@ -152,6 +160,7 @@ func validate(cfg Config) (validatedConfig, error) {
 		RegistrationPolicy:       cfg.RegistrationPolicy,
 		RegistrationRelayEnabled: cfg.RegistrationRelayEnabled,
 		TURN:                     turnCfg,
+		AccountTokenTTL:          cfg.AccountTokenTTL, AuthRefreshTTL: cfg.AuthRefreshTTL, AuthAbsoluteTTL: cfg.AuthAbsoluteTTL, AuthAccessOverlap: cfg.AuthAccessOverlap,
 	}
 	return v, nil
 }

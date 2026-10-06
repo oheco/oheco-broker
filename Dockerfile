@@ -4,7 +4,7 @@
 # Both index digests include native linux/amd64 and linux/arm64 images.
 FROM golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195 AS builder
 
-ARG APP_VERSION=0.4.0
+ARG APP_VERSION=0.5.0
 ARG SOURCE_REVISION
 ARG NATIVE_JOBS=4
 ENV CC=gcc CXX=g++ CGO_ENABLED=1 \
@@ -52,7 +52,7 @@ RUN . /build/sdk/remote-sdk/remote.env \
     && gcc -std=c11 -D_GNU_SOURCE -DJUICE_STATIC -DCURL_STATICLIB -Wall -Wextra -Werror \
         -Wno-error=misleading-indentation -pthread \
         -Isdk/c/remote -I"${OB_NATIVE_PREFIX}/include" -I"${OB_CURL_PREFIX}/include" \
-        sdk/c/remote/ob_api.c sdk/c/remote/ob_json.c tests/c/remote_api_test.c \
+        sdk/c/remote/ob_api.c sdk/c/remote/ob_auth.c sdk/c/remote/ob_json.c tests/c/remote_api_test.c \
         "${OB_CURL_PREFIX}/lib/libcurl.a" "${OB_NATIVE_PREFIX}/lib/libcjson.a" \
         "${OB_NATIVE_PREFIX}/lib/libssl.a" "${OB_NATIVE_PREFIX}/lib/libcrypto.a" \
         -l"${OB_CXX_RUNTIME}" -pthread -lm -ldl -o /build/remote-api-test \
@@ -61,6 +61,8 @@ RUN . /build/sdk/remote-sdk/remote.env \
     && /build/remote-api-test --keylog-existing \
     && /build/sdk/remote-sdk/websocket_test \
     && /build/sdk/remote-sdk/remote_peer_test \
+    && python3 -B tests/auth_refresh.py --cli /out/oheco-broker --fixture /build/control-fixture \
+        --native-auth /build/sdk/remote-sdk/auth_refresh_test \
     && python3 -B tests/cli_control.py /out/oheco-broker \
     && python3 -B tests/remote_acceptance.py --fixture /build/control-fixture \
         --native /build/sdk/remote-sdk/remote_peer_test --api-test /build/remote-api-test \
@@ -95,7 +97,7 @@ shutil.copy2(root / 'vendor/modules.txt', out / 'go-vendor-modules.txt')
 PY
 
 FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
-ARG APP_VERSION=0.4.0
+ARG APP_VERSION=0.5.0
 ARG SOURCE_REVISION
 LABEL org.opencontainers.image.title="oheco-broker" \
       org.opencontainers.image.description="Independent SQLite/TLS/STUN-TURN server and native C SDK broker CLI" \

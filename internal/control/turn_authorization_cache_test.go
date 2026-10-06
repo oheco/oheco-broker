@@ -141,16 +141,19 @@ func TestTURNAuthorizationCacheRejectsInvalidatedReads(t *testing.T) {
 		t.Run(phase, func(t *testing.T) {
 			started, release := make(chan struct{}), make(chan struct{})
 			var reads atomic.Int64
+			var authority atomic.Bool
+			authority.Store(true)
 			var signal sync.Once
 			c := testTURNAuthorizationCache(t, 4, func(ctx context.Context, key turnAuthorizationKey) (bool, int64) {
 				n := reads.Add(1)
+				allowed := authority.Load()
 				if phase == "refresh" && n == 1 {
-					return true, timestamp(time.Now().Add(time.Minute))
+					return allowed, timestamp(time.Now().Add(time.Minute))
 				}
 				signal.Do(func() { close(started) })
 				select {
 				case <-release:
-					return true, timestamp(time.Now().Add(time.Minute))
+					return allowed, timestamp(time.Now().Add(time.Minute))
 				case <-ctx.Done():
 					return false, 0
 				}
@@ -165,6 +168,7 @@ func TestTURNAuthorizationCacheRejectsInvalidatedReads(t *testing.T) {
 				go func() { done <- c.authorize("t", "b", "s") }()
 			}
 			<-started
+			authority.Store(false)
 			c.invalidateSession("s")
 			close(release)
 			if <-done {

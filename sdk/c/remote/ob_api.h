@@ -33,7 +33,10 @@ typedef enum {
     OB_API_HTTP = -4,
     OB_API_LIMIT = -5,
     OB_API_JSON = -6,
-    OB_API_CRYPTO = -7
+    OB_API_CRYPTO = -7,
+    OB_API_STORAGE = -8,
+    OB_API_AUTH = -9,
+    OB_API_CANCELLED = -10
 } ob_api_code;
 
 typedef struct {

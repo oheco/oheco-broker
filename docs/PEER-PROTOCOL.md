@@ -550,7 +550,8 @@ fail setup rather than cause an unauthenticated/direct fallback. A future Worker
 provider is not implemented or claimed by this local native work.
 
 Explicit managed client-peer close uses a bounded REST deletion of its logical
-connection with the original account bearer, so an already-expired session token
+connection with a current account bearer from the original stable login authority
+(or its original legacy bearer), so an already-expired session token
 cannot prevent final closure. Legacy peer close sends WS `delete`; explicit
 server close sends WS `offline` and revokes its sessions/lineages. Cleanup has a
 300 ms best-effort operation budget. If a WS close RPC fails or times out, its

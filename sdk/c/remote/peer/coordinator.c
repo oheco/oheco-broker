@@ -100,6 +100,17 @@ static int open_session(ob_remote_peer *p, ob_remote_error *error)
     ob_api_error ae = {0};
     int rc = ob_api_request_cancelled(p->api, "POST", path, NULL, payload, &response_text,
                                        &ae, request_cancel, p);
+    /* This managed session proposal has its own persisted-in-handle CAS/request
+     * identity. Retry only that exact idempotent transaction after refreshing an
+     * account 401; generic mutation RPCs retain their no-replay behavior. */
+    if (rc && p->control_managed && p->api->auth && ae.http_status == 401 && !request_cancel(p)) {
+        ob_api_error refresh_error = {0};
+        if (!ob_auth_manager_refresh_cancelled(p->api->auth, 1, &refresh_error, request_cancel, p)) {
+            ob_api_response_free(response_text); response_text = NULL;
+            rc = ob_api_request_cancelled(p->api, "POST", path, NULL, payload, &response_text,
+                                           &ae, request_cancel, p);
+        }
+    }
     OPENSSL_cleanse(payload, strlen(payload)); free(payload);
     cJSON *response = response_text && *response_text ? ob_peer_json_parse(response_text) : NULL;
     ob_api_response_free(response_text);

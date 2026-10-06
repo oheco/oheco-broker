@@ -22,7 +22,10 @@ import (
 	"golang.org/x/term"
 )
 
-type rootOptions struct{ api, config, ca string }
+type rootOptions struct {
+	api, config, ca string
+	profileLocked   bool // Captured by the storage adapter while this command owns the lock.
+}
 
 func Execute(ctx context.Context, args []string, version string, shell func(context.Context) error) error {
 	options := &rootOptions{}
@@ -77,7 +80,13 @@ func (o *rootOptions) newClient(auth bool) (*remote.Client, config, string, erro
 	if ca == "" {
 		ca = cfg.CAFile
 	}
-	client, err := remote.New(remote.Options{URL: endpoint, Token: token, CAFile: ca, Timeout: 10 * time.Second})
+	options := remote.Options{URL: endpoint, Token: token, CAFile: ca, Timeout: 10 * time.Second}
+	if auth && cfg.Auth != nil {
+		store := newProfileAuthStorage(path, cfg, o.profileLocked)
+		client, e := remote.NewWithAuth(options, remote.AuthOptions{Credentials: cfg.authCredentials(), Storage: store})
+		return client, cfg, path, e
+	}
+	client, err := remote.New(options)
 	return client, cfg, path, err
 }
 func printJSON(cmd *cobra.Command, raw json.RawMessage) error {
@@ -98,7 +107,7 @@ func redactSecrets(value any) {
 	case map[string]any:
 		for key, child := range v {
 			switch key {
-			case "token", "device_token", "session_token", "password", "credential", "password_hash":
+			case "token", "access_token", "refresh_token", "next_token", "next_refresh_token", "device_token", "session_token", "password", "credential", "password_hash":
 				delete(v, key)
 			default:
 				redactSecrets(child)
@@ -177,13 +186,16 @@ func serverCommands() *cobra.Command {
 	var listen, db, tokenFile, policy, turnListen, publicIP, tlsCert, tlsKey string
 	var turnEnabled, allowLoopback, registrationRelay bool
 	var relayMinPort, relayMaxPort uint16
-	var lease, sessionTTL time.Duration
+	var lease, sessionTTL, accountTTL, refreshTTL, absoluteTTL, accessOverlap time.Duration
 	var tlsOptions servertls.Options
 	serve := &cobra.Command{Use: "serve", Args: cobra.NoArgs, Short: "Run the local-first control plane", RunE: func(cmd *cobra.Command, _ []string) error {
 		// Reject an invalid range before reading credentials, creating state, or
 		// opening listeners, including when TURN is disabled.
 		if (relayMinPort == 0) != (relayMaxPort == 0) || relayMinPort > relayMaxPort {
 			return errors.New("--turn-relay-min-port and --turn-relay-max-port must both be zero (ephemeral) or define an inclusive range from 1 to 65535 with min <= max")
+		}
+		if accountTTL < 0 || refreshTTL < 0 || absoluteTTL < 0 || accessOverlap < 0 {
+			return errors.New("authentication lifetimes must be nonnegative")
 		}
 		token := os.Getenv("OHECO_BROKER_ADMIN_TOKEN")
 		var err error
@@ -224,7 +236,7 @@ func serverCommands() *cobra.Command {
 		if err = privateDirectory(db); err != nil {
 			return err
 		}
-		service, err := control.New(control.Config{ListenAddr: listen, DBPath: db, AdminToken: token, RegistrationPolicy: policy, RegistrationRelayEnabled: registrationRelay, BrokerLease: lease, SessionTTL: sessionTTL, TURN: control.TURNConfig{Enabled: turnEnabled, ListenAddr: turnListen, PublicIP: publicIP, RelayMinPort: relayMinPort, RelayMaxPort: relayMaxPort, AllowLoopbackPeers: allowLoopback}})
+		service, err := control.New(control.Config{ListenAddr: listen, DBPath: db, AdminToken: token, RegistrationPolicy: policy, RegistrationRelayEnabled: registrationRelay, AccountTokenTTL: accountTTL, AuthRefreshTTL: refreshTTL, AuthAbsoluteTTL: absoluteTTL, AuthAccessOverlap: accessOverlap, BrokerLease: lease, SessionTTL: sessionTTL, TURN: control.TURNConfig{Enabled: turnEnabled, ListenAddr: turnListen, PublicIP: publicIP, RelayMinPort: relayMinPort, RelayMaxPort: relayMaxPort, AllowLoopbackPeers: allowLoopback}})
 		if err != nil {
 			return err
 		}
@@ -296,6 +308,10 @@ func serverCommands() *cobra.Command {
 	f.StringVar(&tlsOptions.ACMECacheDir, "acme-cache", "", "Private persistent ACME account and certificate cache directory (0700)")
 	f.StringVar(&tlsOptions.ACMEDirectoryURL, "acme-directory", "", "ACME directory URL; empty uses Let's Encrypt production")
 	f.BoolVar(&tlsOptions.ACMEAcceptTOS, "acme-accept-tos", false, "Accept the configured ACME CA's terms of service")
+	f.DurationVar(&accountTTL, "account-token-ttl", 24*time.Hour, "Account access token lifetime")
+	f.DurationVar(&refreshTTL, "auth-refresh-ttl", 30*24*time.Hour, "Sliding login refresh idle lifetime")
+	f.DurationVar(&absoluteTTL, "auth-absolute-ttl", 0, "Absolute login lifetime; zero disables the limit")
+	f.DurationVar(&accessOverlap, "auth-access-overlap", 2*time.Minute, "Superseded access token admission overlap")
 	f.DurationVar(&lease, "broker-lease", 90*time.Second, "Broker heartbeat lease")
 	f.DurationVar(&sessionTTL, "session-ttl", 10*time.Minute, "Renewable peer session lifetime")
 	parent.AddCommand(serve)

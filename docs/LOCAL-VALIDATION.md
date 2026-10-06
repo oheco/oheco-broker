@@ -1,4 +1,14 @@
-# 0.3.0 验收索引
+# 原生验收索引
+
+## 0.5.0 账户自动刷新
+
+刷新验收通过 `scripts/test-remote.sh` 集成：真实 SQLite/Pion fixture、签名 CLI/C SDK、短期限 access/refresh、持续 TCP/UDP 与实际 TURN 计量；可独立运行 `tests/auth_refresh.py` 并用 `--native-auth` 选择独立 C 客户端。验收覆盖原 socket/FD、监听和逻辑代数保持、零账户 HTTP 的空闲刷新、六进程单个提交、过期 access 恢复、回包丢失、进程重启、不安全 journal 拒绝与显式撤销。
+
+SDK 的20个签名 Go 测试函数及静态检查覆盖单个并发刷新事务、存储失败／回调生命周期、关闭取消，以及原本地 refresh 期限已过时的已提交回执恢复（分别验证 access 尚活与已过期）。TURN 授权回归在 SQL 查询与缓存发布之间执行另一会话退出，验证同租户及跨租户的同一实际 allocation 继续双向 UDP；匹配的失效标记重新读当前权限，已撤销权限继续拒绝。
+
+完整机制、迁移方式与发行结果见[账户刷新](<AUTH-REFRESH.md>)及[0.5.0 说明](<releases/v0.5.0.md>)。本页以下记录为历史版本，不能代替当前产物的验收。
+
+## 0.3.0 历史验收
 
 本次 0.3.0 清理后的 HarmonyOS arm64 原生离线 SDK 构建、完整 Go 测试与 vet、新控制面/C/Go/WSS/真实 direct 与 TURN TCP/UDP 验收，以及原 shell/C/.NET 生命周期与真实 .NET 构建回归均已通过。完整固定源码清单（五套 C 依赖与 Gorilla WebSocket）和归档策略检查通过。最终归档、独立解压 SDK 构建与正式索引安装结果见下文发行复核记录；本页同时区分历史公网验证范围。
 

@@ -38,6 +38,9 @@ type Config struct {
 	RegistrationRelayEnabled bool   // enable relay for newly registered tenants; default false
 	TURN                     TURNConfig
 	AccountTokenTTL          time.Duration
+	AuthRefreshTTL           time.Duration // idle lifetime; zero defaults to 30 days
+	AuthAbsoluteTTL          time.Duration // zero permits continuously refreshed sessions
+	AuthAccessOverlap        time.Duration // zero defaults to two minutes
 	SessionTTL               time.Duration
 	BrokerLease              time.Duration
 	UsageFlushInterval       time.Duration
@@ -96,6 +99,7 @@ type Session struct {
 	ExpiresAt         time.Time `json:"expires_at"`
 	ConnectionID      string    `json:"connection_id,omitempty"`
 	Generation        uint64    `json:"generation,omitempty"`
+	AuthSession       string    `json:"-"`
 }
 type Message struct {
 	Sequence int64  `json:"sequence"`
@@ -137,7 +141,7 @@ func New(cfg Config) (*Server, error) {
 	if !validPolicy(cfg.RegistrationPolicy) {
 		return nil, errors.New("control: invalid registration policy")
 	}
-	if cfg.AccountTokenTTL < 0 || cfg.SessionTTL < 0 || cfg.BrokerLease < 0 || cfg.UsageFlushInterval < 0 || cfg.TenantDailyByteQuota < 0 || cfg.MaxSessionsPerTenant < 0 || cfg.MaxMessagesPerDirection < 0 || cfg.MaxMessageBytes < 0 {
+	if cfg.AccountTokenTTL < 0 || cfg.AuthRefreshTTL < 0 || cfg.AuthAbsoluteTTL < 0 || cfg.AuthAccessOverlap < 0 || cfg.SessionTTL < 0 || cfg.BrokerLease < 0 || cfg.UsageFlushInterval < 0 || cfg.TenantDailyByteQuota < 0 || cfg.MaxSessionsPerTenant < 0 || cfg.MaxMessagesPerDirection < 0 || cfg.MaxMessageBytes < 0 {
 		return nil, errors.New("control: durations, quotas and limits cannot be negative")
 	}
 	if cfg.MaxSessionsPerTenant > 10000 || cfg.MaxMessagesPerDirection > 1024 {
@@ -145,6 +149,12 @@ func New(cfg Config) (*Server, error) {
 	}
 	if cfg.AccountTokenTTL <= 0 {
 		cfg.AccountTokenTTL = 24 * time.Hour
+	}
+	if cfg.AuthRefreshTTL == 0 {
+		cfg.AuthRefreshTTL = 30 * 24 * time.Hour
+	}
+	if cfg.AuthAccessOverlap == 0 {
+		cfg.AuthAccessOverlap = 2 * time.Minute
 	}
 	if cfg.SessionTTL <= 0 {
 		cfg.SessionTTL = 10 * time.Minute
@@ -360,7 +370,7 @@ func (s *Server) migrate() error {
 	if err = s.db.QueryRow("SELECT version FROM schema_version").Scan(&v); err != nil {
 		return err
 	}
-	if v != 1 && v != 2 {
+	if v != 1 && v != 2 && v != 3 {
 		return fmt.Errorf("control: unsupported schema version %d", v)
 	}
 	tx, err := s.db.Begin()
@@ -375,6 +385,9 @@ func (s *Server) migrate() error {
  CREATE INDEX IF NOT EXISTS connection_sessions_connection ON connection_sessions(connection_id,generation);
  UPDATE schema_version SET version=2;`)
 	if err != nil {
+		return err
+	}
+	if err = s.migrateAuth(tx); err != nil {
 		return err
 	}
 	if err = tx.Commit(); err != nil {
@@ -460,7 +473,7 @@ func (s *Server) session(id string) (Session, error) {
 	var v Session
 	var peer, relay int
 	var expiry int64
-	e := s.db.QueryRow("SELECT s.id,s.tenant_id,s.broker_id,s.relay_mode,s.peer_authenticated,s.relay_approved,s.expires_at,COALESCE(c.connection_id,''),COALESCE(c.generation,0) FROM sessions s LEFT JOIN connection_sessions c ON c.session_id=s.id WHERE s.id=?", id).Scan(&v.ID, &v.TenantID, &v.BrokerID, &v.RelayMode, &peer, &relay, &expiry, &v.ConnectionID, &v.Generation)
+	e := s.db.QueryRow("SELECT s.id,s.tenant_id,s.broker_id,s.relay_mode,s.peer_authenticated,s.relay_approved,s.expires_at,COALESCE(c.connection_id,''),COALESCE(c.generation,0),COALESCE(s.auth_session_id,'') FROM sessions s LEFT JOIN connection_sessions c ON c.session_id=s.id WHERE s.id=?", id).Scan(&v.ID, &v.TenantID, &v.BrokerID, &v.RelayMode, &peer, &relay, &expiry, &v.ConnectionID, &v.Generation, &v.AuthSession)
 	if errors.Is(e, sql.ErrNoRows) {
 		return v, fail(404, "session not found")
 	}
@@ -472,6 +485,7 @@ func (s *Server) session(id string) (Session, error) {
 
 type principal struct {
 	kind, tenant, broker, session string
+	authSession                   string
 	version                       int
 }
 
@@ -499,7 +513,7 @@ func (s *Server) authWithPending(r *http.Request, allowPending bool, kinds ...st
 		}
 		hash = tokenHash(token)
 	}
-	e := s.db.QueryRow("SELECT kind,tenant_id,COALESCE(broker_id,''),COALESCE(session_id,''),version,expires_at FROM tokens WHERE hash=?", hash).Scan(&p.kind, &p.tenant, &p.broker, &p.session, &p.version, &expiry)
+	e := s.db.QueryRow("SELECT kind,tenant_id,COALESCE(broker_id,''),COALESCE(session_id,''),version,expires_at,COALESCE(auth_session_id,'') FROM tokens WHERE hash=?", hash).Scan(&p.kind, &p.tenant, &p.broker, &p.session, &p.version, &expiry, &p.authSession)
 	if errors.Is(e, sql.ErrNoRows) {
 		return p, fail(401, "invalid bearer")
 	}
@@ -507,7 +521,15 @@ func (s *Server) authWithPending(r *http.Request, allowPending bool, kinds ...st
 		return p, e
 	}
 	if expiry <= now() {
+		if p.authSession != "" && p.kind == "account" {
+			return p, authFailure(401, "account_token_expired")
+		}
 		return p, fail(401, "expired bearer")
+	}
+	if p.authSession != "" {
+		if _, e = authAuthority(s.db, p.authSession, p.tenant, p.version, true); e != nil {
+			return p, e
+		}
 	}
 	accepted := false
 	for _, kind := range kinds {
@@ -561,13 +583,16 @@ func txActive(tx *sql.Tx, p principal) error {
 // txPrincipal closes the authentication-to-mutation race on the single SQLite
 // owner. Device rotation may delete a token without changing tenant version.
 func txPrincipal(tx *sql.Tx, r *http.Request, p principal) error {
+	if p.authSession != "" && p.kind == "account" {
+		return txAuthPrincipal(tx, p)
+	}
 	hash, internal := r.Context().Value(wsAuthKey{}).(string)
 	if !internal {
 		hash = tokenHash(bearer(r))
 	}
 	var current principal
 	var expiry int64
-	err := tx.QueryRow("SELECT kind,tenant_id,COALESCE(broker_id,''),COALESCE(session_id,''),version,expires_at FROM tokens WHERE hash=?", hash).Scan(&current.kind, &current.tenant, &current.broker, &current.session, &current.version, &expiry)
+	err := tx.QueryRow("SELECT kind,tenant_id,COALESCE(broker_id,''),COALESCE(session_id,''),version,expires_at,COALESCE(auth_session_id,'') FROM tokens WHERE hash=?", hash).Scan(&current.kind, &current.tenant, &current.broker, &current.session, &current.version, &expiry, &current.authSession)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fail(401, "revoked bearer")
 	}
@@ -577,9 +602,17 @@ func txPrincipal(tx *sql.Tx, r *http.Request, p principal) error {
 	if current != p || expiry <= now() {
 		return fail(401, "expired or changed bearer")
 	}
+	if p.authSession != "" {
+		if err = txAuthPrincipal(tx, p); err != nil {
+			return err
+		}
+	}
 	return txActive(tx, p)
 }
 func txSessionLive(tx *sql.Tx, v Session) error {
+	if err := checkSessionAuth(tx, v); err != nil {
+		return err
+	}
 	if err := txManagedSession(tx, v); err != nil {
 		return err
 	}
@@ -659,6 +692,7 @@ func (s *Server) maintenance() {
 			// Unknown lineages fail closed. Never discard an authorized idle
 			// connection merely because its transport lease naturally expired.
 			_ = s.pruneConnections()
+			_, _ = s.db.Exec("DELETE FROM auth_sessions WHERE (revoked_reason<>'' OR refresh_expires_at<=?) AND NOT EXISTS(SELECT 1 FROM tokens WHERE tokens.auth_session_id=auth_sessions.id) AND NOT EXISTS(SELECT 1 FROM connections WHERE connections.auth_session_id=auth_sessions.id) AND NOT EXISTS(SELECT 1 FROM sessions WHERE sessions.auth_session_id=auth_sessions.id)", now())
 		}
 	}
 }

@@ -152,7 +152,7 @@ def main():
             run([args.native, url, "--force", "--idle"], "C authenticated actual Pion TURN idle and TCP UDP mapping", timeout=210)
             account_path = config / "oheco-broker" / "account.json"
             base = [args.binary, "--api", url]
-            registered = json.loads(run(base + ["tenant", "register", "--email", "local@example.invalid"], "CLI account registration"))
+            registered = json.loads(run(base + ["tenant", "register", "--legacy-auth", "--email", "local@example.invalid"], "CLI account registration"))
             tenant_id = registered["tenant"]["id"]
             saved = json.loads(account_path.read_text())
             if len(saved["account"]["password"]) != 32 or account_path.stat().st_mode & 0o077:

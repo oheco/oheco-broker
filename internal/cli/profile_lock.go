@@ -7,12 +7,19 @@ import (
 	"syscall"
 )
 
+var errProfileBusy = errors.New("account profile is being modified by another command; retry when it finishes")
+
 func (o *rootOptions) lockProfile() (func(), error) {
 	path, err := o.path()
 	if err != nil {
 		return nil, err
 	}
-	return acquireProfile(path)
+	release, err := acquireProfile(path)
+	if err != nil {
+		return nil, err
+	}
+	o.profileLocked = true
+	return func() { o.profileLocked = false; release() }, nil
 }
 
 // Kernel-owned advisory locks serialize profile mutations and release on crash.
@@ -43,7 +50,7 @@ func acquireProfile(path string) (func(), error) {
 	if err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		file.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
-			return nil, errors.New("account profile is being modified by another command; retry when it finishes")
+			return nil, errProfileBusy
 		}
 		return nil, err
 	}

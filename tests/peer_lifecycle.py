@@ -170,7 +170,7 @@ def main():
         try:
             fixture, information = boot()
             url = information["api"]
-            cli(["tenant", "register"])
+            cli(["tenant", "register", "--legacy-auth"])
             password = secrets.token_hex(16)
             target = "127.0.0.1:" + str(echo.getsockname()[1])
             broker, broker_log = start([args.binary, "--api", url, "tenant", "serve", "--name", "lifecycle",

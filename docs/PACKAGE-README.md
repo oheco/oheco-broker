@@ -1,4 +1,4 @@
-# oheco-broker 0.4.0 — HarmonyOS arm64
+# oheco-broker 0.5.0 — HarmonyOS arm64
 
 Authenticated peer TCP/UDP mappings with SQLite management, WS/WSS signaling and standalone STUN/TURN. The package includes executable commands and **source SDKs**; it does not distribute prebuilt SDK libraries.
 
@@ -14,7 +14,7 @@ Authenticated peer TCP/UDP mappings with SQLite management, WS/WSS signaling and
 
 `bin/oheco-broker-server` is a separate signed ELF for the SQLite management, HTTPS/WSS and UDP STUN/TURN backend. It needs the system C runtime, and does not load the native peer SDK or C++ runtime. Run the platform-matching server executable; a Linux server is built natively from the full source checkout.
 
-Installation does not start a service or configure system startup. Through oheco, use `oheco-broker` and `oheco-broker-server`; `oheco-broker@0.4.0` selects the client version. No arguments show help. The legacy local command service requires explicit `oheco-broker shell serve`.
+Installation does not start a service or configure system startup. Through oheco, use `oheco-broker` and `oheco-broker-server`; `oheco-broker@0.5.0` selects the client version. No arguments show help. The legacy local command service requires explicit `oheco-broker shell serve`.
 
 ## Source SDKs
 
@@ -26,6 +26,8 @@ Installation does not start a service or configure system startup. Through oheco
 The C and Go peer SDKs retain handles and listening ports across bounded automatic retries, and expose asynchronous manual recovery after retries pause. With both endpoints using mapping v2, live TCP sockets can recover within the configured grace period; UDP drops stale packets. CLI users can request recovery with `SIGUSR1` and observe optional `--state-events`. See `docs/RECONNECT.md` and the SDK READMEs for integration.
 
 A host embedding the remote C SDK must provide its platform's C/C++ runtimes even when SDK dependencies are statically linked; the CLI's private runtime does not automatically configure an unrelated host application. Keep the fixed BoringSSL implementation consistent across peer and curl inputs.
+
+Account credentials refresh automatically with a compatible server. Run `tenant login` once to migrate a legacy profile; version2 profiles store refresh credentials without the account password. Registration requires an account password through interactive input or `--password-stdin`. Routine refresh preserves peers, listening ports and live TCP sockets. The defaults are 24-hour access and 30-day sliding refresh lifetime; expired/revoked refresh authority requires explicit login. Use a separate `--config` with older CLI versions, or explicitly register/login with `--legacy-auth`. See `docs/AUTH-REFRESH.md` for SDK storage hooks and recovery guarantees.
 
 ## Use and boundaries
 

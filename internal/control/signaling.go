@@ -102,7 +102,7 @@ func (s *Server) registerBroker(w http.ResponseWriter, r *http.Request) error {
 	if _, e = tx.Exec("INSERT INTO brokers(id,tenant_id,name,lease_expires_at,created_at) VALUES(?,?,?,?,?)", id, p.tenant, body.Name, timestamp(lease), now()); e != nil {
 		return e
 	}
-	token, e := issue(tx, "device", p.tenant, id, "", p.version, time.Now().Add(365*24*time.Hour))
+	token, e := s.issueDevice(tx, p, id)
 	if e != nil {
 		return e
 	}
@@ -227,7 +227,7 @@ func (s *Server) rotateDevice(w http.ResponseWriter, r *http.Request) error {
 	if _, e = tx.Exec("DELETE FROM tokens WHERE kind='device' AND broker_id=?", b.ID); e != nil {
 		return e
 	}
-	token, e := issue(tx, "device", p.tenant, b.ID, "", p.version, time.Now().Add(365*24*time.Hour))
+	token, e := s.issueDevice(tx, p, b.ID)
 	if e != nil {
 		return e
 	}
@@ -273,6 +273,19 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) error {
 	defer tx.Rollback()
 	if e = txPrincipal(tx, r, p); e != nil {
 		return e
+	}
+	if p.authSession != "" {
+		a, err := authAuthority(tx, p.authSession, p.tenant, p.version, false)
+		if err != nil {
+			return err
+		}
+		h := tokenHash(bearer(r))
+		if v, ok := r.Context().Value(wsAuthKey{}).(string); ok {
+			h = v
+		}
+		if _, e = tx.Exec("UPDATE tokens SET expires_at=? WHERE hash=? AND kind='device'", min(a.RefreshExpiry, timestamp(time.Now().Add(365*24*time.Hour))), h); e != nil {
+			return e
+		}
 	}
 	if _, e = tx.Exec("UPDATE brokers SET lease_expires_at=? WHERE id=?", timestamp(time.Now().Add(s.cfg.BrokerLease)), b.ID); e != nil {
 		return e
@@ -418,10 +431,13 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) error {
 	}
 	id := uuid()
 	expiry := time.Now().Add(s.cfg.SessionTTL)
-	if _, e = tx.Exec("INSERT INTO sessions(id,tenant_id,broker_id,relay_mode,expires_at) VALUES(?,?,?,?,?)", id, p.tenant, b.ID, body.RelayMode, timestamp(expiry)); e != nil {
+	if _, e = tx.Exec("INSERT INTO sessions(id,tenant_id,broker_id,relay_mode,expires_at,auth_session_id) VALUES(?,?,?,?,?,?)", id, p.tenant, b.ID, body.RelayMode, timestamp(expiry), nullAuthSession(p.authSession)); e != nil {
 		return e
 	}
 	token, e := issue(tx, "session", p.tenant, b.ID, id, p.version, expiry)
+	if e == nil && p.authSession != "" {
+		_, e = tx.Exec("UPDATE tokens SET auth_session_id=? WHERE hash=?", p.authSession, tokenHash(token))
+	}
 	if e != nil {
 		return e
 	}
@@ -439,6 +455,9 @@ func (s *Server) sessionPrincipal(r *http.Request) (principal, Session, string, 
 	}
 	v, e := s.session(r.PathValue("id"))
 	if e != nil {
+		return p, v, "", e
+	}
+	if e = checkSessionAuth(s.db, v); e != nil {
 		return p, v, "", e
 	}
 	if e = s.managedSession(v); e != nil {

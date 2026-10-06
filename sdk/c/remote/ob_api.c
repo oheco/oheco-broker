@@ -174,6 +174,7 @@ done:
 }
 void ob_api_client_destroy(ob_api_client *c) {
     if (!c) return;
+    ob_auth_manager_destroy(c->auth);
     free(c->base_url); secret_free(c->tenant_token); free(c->ca_file);
     free(c->localhost_resolve); erase(c, sizeof(*c)); free(c);
 }
@@ -223,7 +224,7 @@ static int request_progress(void *arg, curl_off_t download_total, curl_off_t dow
     struct request_cancel *cancel = arg;
     return cancel->callback ? cancel->callback(cancel->user) : 0;
 }
-int ob_api_request_cancelled(ob_api_client *c, const char *method, const char *path,
+static int request_raw(ob_api_client *c, const char *method, const char *path,
                     const char *bearer, const char *body, char **out, ob_api_error *e,
                     ob_api_cancel_callback callback, void *user) {
     struct request_cancel cancel = {callback, user};
@@ -333,6 +334,38 @@ done:
     return result;
 #undef SETOPT
 #undef ADD_HEADER
+}
+
+int ob_api_request_cancelled(ob_api_client *c, const char *method, const char *path,
+                    const char *bearer, const char *body, char **out, ob_api_error *e,
+                    ob_api_cancel_callback callback, void *user) {
+    char account_token[65] = {0};
+    if (c && c->auth && !bearer) {
+        reset(e, out);
+        int rc = ob_auth_account_bearer(c->auth, account_token, e, callback, user);
+        if (rc) { erase(account_token, sizeof(account_token)); return rc; }
+        bearer = account_token;
+    }
+    int rc = request_raw(c, method, path, bearer, body, out, e, callback, user);
+    /* GET is idempotent. A refresh may recover an access credential superseded
+     * by another process; NEVER replay an arbitrary mutation or scoped bearer. */
+    if (c && c->auth && bearer == account_token && method && !strcmp(method, "GET")
+        && rc == OB_API_HTTP && e && e->http_status == 401) {
+        ob_api_error refresh_error = {0};
+        ob_auth_credentials current = {0};
+        ob_auth_manager_snapshot(c->auth, &current, &refresh_error);
+        int refresh_result = strcmp(current.token, account_token) ? 0 :
+            ob_auth_manager_refresh_cancelled(c->auth, 1, &refresh_error, callback, user);
+        ob_auth_credentials_clear(&current);
+        if (!refresh_result &&
+            !ob_auth_account_bearer(c->auth, account_token, &refresh_error, callback, user)) {
+            ob_api_response_free(out ? *out : NULL);
+            if (out) *out = NULL;
+            rc = request_raw(c, method, path, account_token, body, out, e, callback, user);
+        }
+    }
+    erase(account_token, sizeof(account_token));
+    return rc;
 }
 
 int ob_api_request(ob_api_client *c, const char *method, const char *path,

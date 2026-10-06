@@ -10,10 +10,10 @@ import "context"
 const turnAuthorizationIdentitySQL = `SELECT
  CASE WHEN t.status='active' AND t.relay_enabled<>0 AND b.tenant_id=t.id THEN 1 ELSE 0 END,
  b.lease_expires_at,
- CASE WHEN v.tenant_id=t.id AND v.broker_id=b.id AND v.peer_authenticated<>0 AND v.relay_approved<>0 AND v.relay_mode<>'never' THEN 1 ELSE 0 END,
- v.expires_at,COALESCE(cs.connection_id,''),COALESCE(cs.generation,0),
- CASE WHEN c.id IS NOT NULL AND c.revoked_reason='' AND ct.status='active' AND ct.version=c.tenant_version AND a.hash IS NOT NULL AND d.hash IS NOT NULL THEN 1 ELSE 0 END,
- COALESCE(a.expires_at,0),COALESCE(d.expires_at,0),
+ CASE WHEN v.tenant_id=t.id AND v.broker_id=b.id AND v.peer_authenticated<>0 AND v.relay_approved<>0 AND v.relay_mode<>'never' AND (v.auth_session_id IS NULL OR sa.id IS NOT NULL AND sa.revoked_reason='' AND sa.version=t.version AND sa.tenant_id=t.id) THEN 1 ELSE 0 END,
+ CASE WHEN v.auth_session_id IS NULL THEN v.expires_at ELSE MIN(v.expires_at,COALESCE(CASE WHEN sa.absolute_expires_at=0 THEN sa.refresh_expires_at ELSE MIN(sa.refresh_expires_at,sa.absolute_expires_at) END,0)) END,COALESCE(cs.connection_id,''),COALESCE(cs.generation,0),
+ CASE WHEN c.id IS NOT NULL AND c.revoked_reason='' AND ct.status='active' AND ct.version=c.tenant_version AND (c.auth_session_id IS NULL AND a.hash IS NOT NULL OR c.auth_session_id IS NOT NULL AND ca.id IS NOT NULL AND ca.revoked_reason='' AND ca.version=c.tenant_version AND ca.tenant_id=c.tenant_id) AND d.hash IS NOT NULL AND (d.auth_session_id IS NULL OR da.id IS NOT NULL AND da.revoked_reason='' AND da.version=c.tenant_version AND da.tenant_id=c.tenant_id) THEN 1 ELSE 0 END,
+ CASE WHEN c.auth_session_id IS NULL THEN COALESCE(a.expires_at,0) ELSE COALESCE(CASE WHEN ca.absolute_expires_at=0 THEN ca.refresh_expires_at ELSE MIN(ca.refresh_expires_at,ca.absolute_expires_at) END,0) END,CASE WHEN d.auth_session_id IS NULL THEN COALESCE(d.expires_at,0) ELSE MIN(COALESCE(d.expires_at,0),COALESCE(CASE WHEN da.absolute_expires_at=0 THEN da.refresh_expires_at ELSE MIN(da.refresh_expires_at,da.absolute_expires_at) END,0)) END,
  COALESCE(cur.expires_at,0),COALESCE(st.expires_at,0),
  CASE WHEN c.current_session_id=v.id AND c.generation=cs.generation THEN 1 ELSE 0 END,
  COALESCE(c.id,''),COALESCE(c.broker_id,''),COALESCE(c.current_session_id,''),
@@ -27,6 +27,9 @@ LEFT JOIN connections c ON c.id=cs.connection_id
 LEFT JOIN tenants ct ON ct.id=c.tenant_id
 LEFT JOIN tokens a ON a.hash=c.account_hash AND a.kind='account' AND a.tenant_id=c.tenant_id AND a.version=c.tenant_version AND COALESCE(a.broker_id,'')=''
 LEFT JOIN tokens d ON d.hash=c.device_hash AND d.kind='device' AND d.tenant_id=c.tenant_id AND d.version=c.tenant_version AND COALESCE(d.broker_id,'')=c.broker_id
+LEFT JOIN auth_sessions sa ON sa.id=v.auth_session_id
+LEFT JOIN auth_sessions ca ON ca.id=c.auth_session_id
+LEFT JOIN auth_sessions da ON da.id=d.auth_session_id
 LEFT JOIN sessions cur ON cur.id=c.current_session_id
 LEFT JOIN tokens st ON st.hash=c.session_token_hash AND st.kind='session' AND st.session_id=cur.id AND st.version=c.tenant_version
 WHERE t.id=?`

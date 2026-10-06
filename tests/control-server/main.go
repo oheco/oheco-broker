@@ -26,6 +26,10 @@ func main() {
 	turnListen := flag.String("turn-listen", "127.0.0.1:0", "Local TURN fixture address")
 	turnSocketBuffer := flag.Int("turn-socket-buffer", 0, "Local TURN socket buffer bytes; zero selects the production default")
 	lease := flag.Duration("broker-lease", 15*time.Second, "Local broker lease for failure injection")
+	accountTTL := flag.Duration("account-token-ttl", 24*time.Hour, "Account access lifetime for refresh tests")
+	refreshTTL := flag.Duration("auth-refresh-ttl", 30*24*time.Hour, "Login refresh idle lifetime for tests")
+	absoluteTTL := flag.Duration("auth-absolute-ttl", 0, "Optional absolute login lifetime for tests")
+	overlap := flag.Duration("auth-access-overlap", 2*time.Minute, "Old access admission overlap for tests")
 	flag.Parse()
 	token := os.Getenv("OB_PEER_TEST_ADMIN_TOKEN")
 	if len(token) < 16 || *db == "" {
@@ -33,7 +37,7 @@ func main() {
 		os.Exit(2)
 	}
 	gate := newGate(nil, token)
-	service, err := control.New(control.Config{DBPath: *db, AdminToken: token, RegistrationPolicy: "open", BrokerLease: *lease, SessionTTL: time.Minute, BeforeWebSocketRequest: gate.beforeWS, TURN: control.TURNConfig{Enabled: true, ListenAddr: *turnListen, PublicIP: "127.0.0.1", AllowLoopbackPeers: true, SocketBufferBytes: *turnSocketBuffer}})
+	service, err := control.New(control.Config{DBPath: *db, AdminToken: token, RegistrationPolicy: "open", AccountTokenTTL: *accountTTL, AuthRefreshTTL: *refreshTTL, AuthAbsoluteTTL: *absoluteTTL, AuthAccessOverlap: *overlap, BrokerLease: *lease, SessionTTL: time.Minute, BeforeWebSocketRequest: gate.beforeWS, TURN: control.TURNConfig{Enabled: true, ListenAddr: *turnListen, PublicIP: "127.0.0.1", AllowLoopbackPeers: true, SocketBufferBytes: *turnSocketBuffer}})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

@@ -313,7 +313,10 @@ class Fixture:
         return result.stdout
 
     def registration(self, binary):
-        result = json.loads(self.run(self.cli(binary, ["tenant", "register"]), "register"))
+        parts = ["tenant", "register"]
+        if binary == self.args.new_binary:
+            parts.append("--legacy-auth")
+        result = json.loads(self.run(self.cli(binary, parts), "register"))
         stored = json.loads(self.account.read_text())
         require("token" not in result, "registration printed an account token")
         for field in ("password", "token"):
@@ -596,15 +599,15 @@ def main():
         root = Path(directory)
         version_env = dict(os.environ, TMPDIR=str(root), XDG_CONFIG_HOME=str(root / "version-config"))
         version_env.pop("LD_PRELOAD", None)
-        for binary, expected in ((args.old_binary, "0.3.0"), (args.new_binary, "0.4.0")):
+        for binary, expected in ((args.old_binary, "0.3.0"), (args.new_binary, "0.5.0")):
             result = subprocess.run([binary, "--version"], env=version_env, cwd=root, stdin=subprocess.DEVNULL,
                                     capture_output=True, text=True, timeout=args.ready_timeout)
             require(result.returncode == 0 and result.stdout.strip() == "oheco-broker " + expected,
                     f"expected CLI version {expected}, got {result.returncode}: {result.stdout.strip()}")
         results = []
         for label, broker, caller, new_is_broker in (
-                ("old-0.3-broker_new-0.4-caller", args.old_binary, args.new_binary, False),
-                ("new-0.4-broker_old-0.3-caller", args.new_binary, args.old_binary, True)):
+                ("old-0.3-broker_new-0.5-caller", args.old_binary, args.new_binary, False),
+                ("new-0.5-broker_old-0.3-caller", args.new_binary, args.old_binary, True)):
             scenario_root = root / label
             scenario_root.mkdir(mode=0o700)
             results.append(scenario(args, str(scenario_root), label, broker, caller, new_is_broker))
@@ -614,7 +617,7 @@ def main():
     require(digest(__file__) == test_source_sha256, "test source changed during acceptance")
     print("PASS " + json.dumps({"event": "peer_v1_compat_complete", "platform": platform.platform(),
           "native_signed_execution_on_harmonyos": platform.system() == "HarmonyOS",
-          "old_version": "0.3.0", "new_version": "0.4.0", "artifacts": artifacts,
+          "old_version": "0.3.0", "new_version": "0.5.0", "artifacts": artifacts,
           "directions": len(results), "resources_cleaned": True,
           "test_source_sha256": test_source_sha256, "artifacts_unchanged": True,
           "scope": "healthy native v1 fallback; transport outage is a separate acceptance gate"},

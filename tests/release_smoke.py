@@ -33,7 +33,7 @@ import time
 import xml.etree.ElementTree as ET
 
 
-RELEASE_VERSION = "0.3.0"
+RELEASE_VERSION = "0.5.0"
 ROOT_NAME = f"oheco-broker-{RELEASE_VERSION}-ohos-arm64"
 VERSION = f"oheco-broker {RELEASE_VERSION}\n".encode("ascii")
 PROXY = "socks5h://127.0.0.1:10808"
@@ -42,7 +42,7 @@ MAX_FRAME = 1048576
 MAX_STREAM = 65536
 MAX_OUTPUT = 8 * MAX_FRAME
 # Independent of the packager; complete trees replace the former SDK whitelist.
-SOURCE_FILES = {name: name for name in ("LICENSE", "protocol/PROTOCOL.md", "go.mod", "go.sum")}
+SOURCE_FILES = {name: name for name in ("LICENSE", "protocol/PROTOCOL.md", "docs/RECONNECT.md", "docs/AUTH-REFRESH.md", "go.mod", "go.sum")}
 SOURCE_FILES["README.md"] = "docs/PACKAGE-README.md"
 SOURCE_TREES = ("sdk/c", "sdk/go", "sdk/dotnet", "vendor", "vendor-manifests")
 GENERATED_FILES = {"bin/oheco-broker", "bin/oheco-broker-server", "libexec/oheco-broker",
@@ -756,7 +756,7 @@ def run_smoke(archive, base, original_path, sdk_env_path):
         require(out == expected and not err, "PATH command-map version failed")
     out, err = local_command([str(binary)], env, base)
     require(b"Usage:" in out and b"shell" in out and b"tenant" in out and not err,
-            "CLI with no arguments must print 0.3.0 help and exit successfully")
+            "CLI with no arguments must print help and exit successfully")
     out, err = local_command([str(server_binary), "--help"], env, base)
     require(b"Usage: oheco-broker-server" in err and not out, "standalone server --help failed")
     require(not (Path(env["HOME"]) / ".oheco/broker/endpoint").exists(), "help/version started the shell server")

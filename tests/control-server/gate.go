@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +24,12 @@ type testGate struct {
 	wsRequests, wsBrokerUpgrades, wsSessionUpgrades  atomic.Int64
 	wsDisconnects                                    atomic.Int64
 	connections                                      map[*gateConnection]struct{}
+	refresh                                          chan struct{}
+	refreshWaiting                                   atomic.Int32
+	refreshRequests, refreshRepliesDropped           atomic.Int64
+	authRegisterCalls, authLoginCalls                atomic.Int64
+	httpAccountRequests                              atomic.Int64
+	dropRefreshReplies                               atomic.Int64
 }
 
 func newGate(next http.Handler, admin string) *testGate {
@@ -116,6 +123,10 @@ func (g *testGate) release() {
 		close(g.broker)
 		g.broker = nil
 	}
+	if g.refresh != nil {
+		close(g.refresh)
+		g.refresh = nil
+	}
 }
 func toggle(channel *chan struct{}, pause bool) {
 	if pause {
@@ -136,9 +147,11 @@ func (g *testGate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if r.Method == "POST" {
 			var body struct {
-				Sessions *bool `json:"sessions"`
-				Broker   *bool `json:"broker"`
-				DropWS   *bool `json:"drop_ws"`
+				Sessions           *bool `json:"sessions"`
+				Broker             *bool `json:"broker"`
+				DropWS             *bool `json:"drop_ws"`
+				DropRefreshReplies *int  `json:"drop_refresh_replies"`
+				HoldRefreshReplies *bool `json:"hold_refresh_replies"`
 			}
 			decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024))
 			decoder.DisallowUnknownFields()
@@ -146,7 +159,17 @@ func (g *testGate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(400)
 				return
 			}
+			if body.DropRefreshReplies != nil && (*body.DropRefreshReplies < 0 || *body.DropRefreshReplies > 100) {
+				w.WriteHeader(400)
+				return
+			}
+			if body.DropRefreshReplies != nil {
+				g.dropRefreshReplies.Store(int64(*body.DropRefreshReplies))
+			}
 			g.mu.Lock()
+			if body.HoldRefreshReplies != nil {
+				toggle(&g.refresh, *body.HoldRefreshReplies)
+			}
 			if body.Sessions != nil {
 				toggle(&g.session, *body.Sessions)
 			}
@@ -167,8 +190,58 @@ func (g *testGate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"http_signal_polls": g.httpSignalPolls.Load(), "http_broker_polls": g.httpBrokerPolls.Load(),
 			"http_heartbeats": g.httpHeartbeats.Load(), "ws_requests": g.wsRequests.Load(),
 			"ws_broker_upgrades": g.wsBrokerUpgrades.Load(), "ws_session_upgrades": g.wsSessionUpgrades.Load(),
-			"ws_disconnects": g.wsDisconnects.Load(),
+			"ws_disconnects":  g.wsDisconnects.Load(),
+			"refresh_waiting": int64(g.refreshWaiting.Load()), "refresh_requests": g.refreshRequests.Load(),
+			"refresh_dropped":     g.refreshRepliesDropped.Load(),
+			"auth_register_calls": g.authRegisterCalls.Load(), "auth_login_calls": g.authLoginCalls.Load(),
+			"http_account_requests": g.httpAccountRequests.Load(),
 		})
+		return
+	}
+	if r.Method == "GET" && (r.URL.Path == "/v1/me" || r.URL.Path == "/v1/capabilities" || r.URL.Path == "/v1/brokers" || r.URL.Path == "/v1/usage") {
+		g.httpAccountRequests.Add(1)
+	}
+	if r.Method == "POST" && r.URL.Path == "/v1/auth/register" {
+		g.authRegisterCalls.Add(1)
+	}
+	if r.Method == "POST" && r.URL.Path == "/v1/auth/login" {
+		g.authLoginCalls.Add(1)
+	}
+	if r.Method == "POST" && r.URL.Path == "/v1/auth/refresh" {
+		g.refreshRequests.Add(1)
+		reply := httptest.NewRecorder()
+		// The real service commits before the test-only reply fault is applied.
+		g.next.ServeHTTP(reply, r)
+		g.mu.Lock()
+		hold := g.refresh
+		g.mu.Unlock()
+		if hold != nil {
+			g.refreshWaiting.Add(1)
+			defer g.refreshWaiting.Add(-1)
+			select {
+			case <-hold:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		if reply.Code == http.StatusOK {
+			for left := g.dropRefreshReplies.Load(); left > 0; left = g.dropRefreshReplies.Load() {
+				if g.dropRefreshReplies.CompareAndSwap(left, left-1) {
+					g.refreshRepliesDropped.Add(1)
+					if hijacker, ok := w.(http.Hijacker); ok {
+						if connection, _, err := hijacker.Hijack(); err == nil {
+							_ = connection.Close()
+						}
+					}
+					return
+				}
+			}
+		}
+		for key, values := range reply.Header() {
+			w.Header()[key] = append([]string(nil), values...)
+		}
+		w.WriteHeader(reply.Code)
+		_, _ = w.Write(reply.Body.Bytes())
 		return
 	}
 	if r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/v1/ws/brokers/") {

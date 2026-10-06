@@ -26,7 +26,7 @@ go build -buildvcs=false -trimpath -o "$priv/oheco-broker" ./cmd/oheco-broker
 go build -buildvcs=false -trimpath -o "$priv/control-fixture" ./tests/control-server
 clang -std=c11 -D_GNU_SOURCE -DJUICE_STATIC -DCURL_STATICLIB -Wall -Wextra -Werror -pthread \
     -I"$root/sdk/c/remote" -I"$OB_NATIVE_PREFIX/include" -I"$OB_CURL_PREFIX/include" \
-    "$root/sdk/c/remote/ob_api.c" "$root/sdk/c/remote/ob_json.c" "$root/tests/c/remote_api_test.c" \
+    "$root/sdk/c/remote/ob_api.c" "$root/sdk/c/remote/ob_auth.c" "$root/sdk/c/remote/ob_json.c" "$root/tests/c/remote_api_test.c" \
     "$OB_CURL_PREFIX/lib/libcurl.a" "$OB_NATIVE_PREFIX/lib/libcjson.a" \
     "$OB_NATIVE_PREFIX/lib/libssl.a" "$OB_NATIVE_PREFIX/lib/libcrypto.a" \
     -lc++ -pthread -lm -ldl -o "$priv/remote-api-test"
@@ -41,6 +41,7 @@ done
 "$priv/remote-api-test" --keylog-existing
 "$OB_WS_TEST"
 "$OB_REMOTE_TEST"
+python3 "$root/tests/auth_refresh.py" --cli "$priv/oheco-broker" --fixture "$priv/control-fixture" --native-auth "$OB_AUTH_TEST"
 python3 "$root/tests/cli_control.py" "$priv/oheco-broker"
 python3 "$root/tests/remote_acceptance.py" --fixture "$priv/control-fixture" \
     --native "$OB_REMOTE_TEST" --api-test "$priv/remote-api-test" --binary "$priv/oheco-broker"

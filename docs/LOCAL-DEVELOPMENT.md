@@ -33,7 +33,7 @@ oheco-broker tenant capabilities
 
 默认注册策略为 `approval`。管理员批准后账号才可使用；relay 权限需要另外启用。服务端首次启动参数仅初始化新数据库，后续策略存储在 SQLite 中，由管理员命令修改。
 
-CLI 默认将账号配置保存到 `$XDG_CONFIG_HOME/oheco-broker/account.json`，实际目录权限 0700、文件 0600。HarmonyOS 不回退到 HOME/hmdfs；`--config` 可选独立私有路径。省略账号密码时生成 128 bit 随机值，编码为 32 个 hex 字符；账号密码与 peer 密码用途不同。
+CLI 默认将账号配置保存到 `$XDG_CONFIG_HOME/oheco-broker/account.json`，实际目录权限 0700、文件 0600。HarmonyOS 不回退到 HOME/hmdfs；`--config` 可选独立私有路径。兼容服务端默认启用自动刷新：注册时通过交互或 `--password-stdin` 设置账户密码，新版配置保存刷新凭据且不保存账户密码。账号密码与 peer 密码用途不同。旧配置执行一次 `tenant login` 即可迁移；显式 `--legacy-auth` 注册／登录保留 v1 静态 token 与保存密码的旧行为，供旧 CLI 使用。
 
 注册请求发出前先保存 `.pending` 凭据。回执丢失时保留该文件，不自动重发注册；用同一凭据登录确认：
 
@@ -41,7 +41,7 @@ CLI 默认将账号配置保存到 `$XDG_CONFIG_HOME/oheco-broker/account.json`�
 oheco-broker --config "$XDG_CONFIG_HOME/oheco-broker/account.json.pending" tenant login
 ```
 
-该命令保存到显式选择的配置路径，之后继续选用该路径或在私有目录迁移。注册、登录、账号修改和退出使用 profile 锁，避免并发覆盖。登录另一设备时使用同一租户的账号凭据。
+该命令保存到显式选择的配置路径，之后继续选用该路径或在私有目录迁移。注册、登录、账号修改、退出和 token 刷新使用原 profile 的持久锁，避免并发覆盖。刷新另用 `.refresh-pending` 保留提交候选；回包丢失或进程崩溃后恢复同一请求，正常刷新不重建 peer 或 socket。默认 access token 24 小时、刷新提前 10 分钟、refresh 闲置 30 天过期；成功刷新延长闲置期限。`tenant refresh` 可手动触发并仅输出代数与期限。详见[刷新机制](AUTH-REFRESH.md)。登录另一设备时使用同一租户的账号凭据，旧 CLI 使用独立 `--config`。
 
 ## 创建映射
 

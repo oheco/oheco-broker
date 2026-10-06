@@ -1,6 +1,6 @@
 # ob-signaling-v1 WS/WSS signaling contract
 
-This is the 0.4.0 scoped Go server and native SDK signaling contract. The WebSocket subprotocol, frame version and existing operations remain `ob-signaling-v1` / 1. REST account/admin management and the [authenticated peer protocol](<PEER-PROTOCOL.md>) are separate contracts. Implementation and release evidence is indexed in [validation](<LOCAL-VALIDATION.md>).
+This is the 0.5.0 scoped Go server and native SDK signaling contract. The WebSocket subprotocol, frame version and existing operations remain `ob-signaling-v1` / 1. REST account/admin management and the [authenticated peer protocol](<PEER-PROTOCOL.md>) are separate contracts. Implementation and release evidence is indexed in [validation](<LOCAL-VALIDATION.md>).
 
 REST provides account/admin operations, broker registration and issuance/deletion of managed logical connections and transport sessions. Persistent broker notifications, PAKE/ICE mailboxes, approval/capabilities, TURN credential requests, heartbeat/lease renewal and scoped lifecycle operations use WS/WSS; the native SDK must not fall back silently to HTTP polling. HTTPS origins map to WSS, loopback HTTP to WS. The peer PAKE suite, signal envelope, certificate pin/exporter and QUIC ALPN remain compatible; mapping v2 recovery fields are authenticated inside that envelope. See the [control API](<CONTROL-API.md>) for `GET /v1/status`, `/v1/connections/{id}/session`, generation CAS and durable authorization bindings.
 
@@ -12,6 +12,8 @@ REST provides account/admin operations, broker registration and issuance/deletio
 - Normal certificate/hostname verification, origin checking, no ambient proxy/redirect/key logging for SDK handles. A present Origin must have the exact request scheme (`http` or `https`) and matching host/port, with no userinfo/path/query/fragment; absent Origin is allowed for explicit bearer clients. Arbitrary forwarded headers do not establish trust. Loopback WS is local-only; external TLS termination requires an explicit trusted listener policy.
 - Each broker watcher and session connection has one C owner thread and one libcurl private handle. One broker watcher plus per-session sockets is deliberate; no competing reads or cross-session bearer reuse. Socket liveness ping/pong is not authorization/lease renewal.
 - Connection bounds are 1024 globally, 128 per tenant, four per bearer+resource. Business scope/cursor/admission denials use ordinary HTTP JSON error statuses (400 malformed protocol/query, 401 invalid bearer, 403 bad role/scope/origin, 404 absent resource, 409 unavailable lease, 410 expired session, 429 admission limit, 503 closed server). RFC6455 transport-handshake failures may use Gorilla's ordinary HTTP error text. No 101 success is returned until initial scope/cursor checks pass.
+
+For login-associated credentials, each continued scope check validates the live stable login authority and tenant version. Account rotation preserves the scoped bearer, WebSocket and forwarding lease. An authenticated heartbeat renews an associated still-valid device secret in place; expired or revoked authority cannot renew. Legacy scopes keep their original fixed deadlines. See [account refresh](<AUTH-REFRESH.md>).
 
 ## Frames
 
@@ -72,7 +74,8 @@ ACK is cumulative **fully consumed** opposite-direction sequence, not a byte rec
 
 A logical connection ID survives individual SIDs. Natural session expiry does not
 revoke its original authorization binding or renew any forwarding lease. A new
-attempt requires the original account bearer and a new request/token at the known
+attempt requires a current access bearer from the same original login session
+(or the original legacy account bearer) and a new request/token at the known
 generation; a replacement SID always starts a fresh mailbox and PAKE exchange.
 The old SID's consumed cursor cannot be used as the new SID's cursor.
 

@@ -13,7 +13,7 @@ import (
 	"syscall"
 )
 
-const Version = "0.4.0"
+const Version = "0.5.0"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -35,6 +35,10 @@ func Execute(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	flags.StringVar(&cfg.AdminTokenFile, "admin-token-file", "", "Private admin token file; otherwise OHECO_BROKER_ADMIN_TOKEN")
 	flags.StringVar(&cfg.RegistrationPolicy, "registration", cfg.RegistrationPolicy, "Initial registration policy: open, approval, or closed (persisted in SQLite)")
 	flags.BoolVar(&cfg.RegistrationRelayEnabled, "registration-relay", cfg.RegistrationRelayEnabled, "Initial TURN eligibility for newly registered accounts (persisted in SQLite)")
+	flags.DurationVar(&cfg.AccountTokenTTL, "account-token-ttl", cfg.AccountTokenTTL, "Account access lifetime (legacy and refreshed); default 24h")
+	flags.DurationVar(&cfg.AuthRefreshTTL, "auth-refresh-ttl", cfg.AuthRefreshTTL, "Sliding refresh idle lifetime; default 720h")
+	flags.DurationVar(&cfg.AuthAbsoluteTTL, "auth-absolute-ttl", cfg.AuthAbsoluteTTL, "Absolute login-session lifetime; 0 disables")
+	flags.DurationVar(&cfg.AuthAccessOverlap, "auth-access-overlap", cfg.AuthAccessOverlap, "Superseded access admission overlap; default 2m")
 	flags.StringVar(&cfg.TURNListenAddr, "turn-listen", "", "UDP4 STUN/TURN listen address; empty disables STUN/TURN")
 	flags.StringVar(&cfg.TURNPublicIP, "turn-public-ip", "", "Advertised unicast IPv4 address; required for wildcard TURN listen")
 	flags.UintVar(&cfg.TURNRelayMinPort, "turn-relay-min-port", 0, "Inclusive relay UDP port range minimum; 0/0 uses ephemeral ports")

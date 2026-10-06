@@ -36,6 +36,9 @@ def main():
                          "--turn-listen", "127.0.0.1:0", "--turn-allow-loopback"],
                          env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=output)
         def command(parts, profile="account.json", success=True, stdin=None, api=None):
+            # Retain coverage of the legacy generated-credential/profile contract.
+            if parts[:2] in (["tenant", "register"], ["tenant", "login"]):
+                parts = parts + ["--legacy-auth"]
             result = subprocess.run([args.binary, "--api", api or url, "--config", str(root / profile)] + parts,
                                     env=env, capture_output=True, text=True, input=stdin, timeout=30)
             if success != (result.returncode == 0):

@@ -16,15 +16,16 @@ import (
 type account struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
-	Password string `json:"password"`
+	Password string `json:"password,omitempty"`
 	Email    string `json:"email,omitempty"`
 	Token    string `json:"token"`
 }
 type config struct {
-	Version int     `json:"version"`
-	API     string  `json:"api"`
-	CAFile  string  `json:"ca_file,omitempty"`
-	Account account `json:"account"`
+	Version int          `json:"version"`
+	API     string       `json:"api"`
+	CAFile  string       `json:"ca_file,omitempty"`
+	Account account      `json:"account"`
+	Auth    *authProfile `json:"auth,omitempty"`
 }
 
 func configPath(explicit string) (string, error) {
@@ -109,12 +110,22 @@ func loadConfig(path string) (config, error) {
 	if err = decoder.Decode(&tail); err != io.EOF {
 		return cfg, errors.New("credential file contains trailing data")
 	}
-	if cfg.Version != 1 || cfg.API == "" {
+	if (cfg.Version != 1 && cfg.Version != 2) || cfg.API == "" {
 		return cfg, errors.New("unsupported or incomplete credential configuration")
+	}
+	if err = validateAuthProfile(cfg); err != nil {
+		return cfg, err
 	}
 	return cfg, nil
 }
 func saveConfig(path string, cfg config) error {
+	if err := validateAuthProfile(cfg); err != nil {
+		return err
+	}
+	return savePrivateJSON(path, cfg)
+}
+
+func savePrivateJSON(path string, value any) error {
 	if err := privateDirectory(path); err != nil {
 		return err
 	}
@@ -125,7 +136,7 @@ func saveConfig(path string, cfg config) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	raw, err := json.MarshalIndent(cfg, "", "  ")
+	raw, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
 		return err
 	}

@@ -7,6 +7,7 @@ package remote
 #cgo LDFLAGS: -lob_remote
 #include <stdlib.h>
 #include "ob_api.h"
+#include "ob_auth.h"
 #include "ob_remote.h"
 */
 import "C"
@@ -15,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime/cgo"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -46,9 +48,13 @@ type Options struct {
 	Timeout            time.Duration
 }
 type Client struct {
-	mu   sync.RWMutex
-	ptr  *C.ob_api_client
-	refs atomic.Int64
+	mu         sync.RWMutex
+	ptr        *C.ob_api_client
+	refs       atomic.Int64
+	cond       *sync.Cond
+	requests   int
+	closing    bool
+	authHandle cgo.Handle
 }
 
 func New(options Options) (*Client, error) {
@@ -74,28 +80,68 @@ func New(options Options) (*Client, error) {
 	if ptr == nil {
 		return nil, apiError(&diag)
 	}
-	return &Client{ptr: ptr}, nil
+	client := &Client{ptr: ptr}
+	client.cond = sync.NewCond(&client.mu)
+	return client, nil
 }
 
 // Close rejects destruction while a server or peer is alive. Active requests
 // finish before destruction. Callers close mappings, peers/servers, then client.
 func (c *Client) Close() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	for c.closing {
+		c.cond.Wait()
+	}
 	if c.ptr == nil {
+		c.mu.Unlock()
 		return nil
 	}
 	if c.refs.Load() != 0 {
+		c.mu.Unlock()
 		return errors.New("remote: close peers and servers before closing client")
 	}
-	C.ob_api_client_destroy(c.ptr)
+	c.closing = true
+	ptr := c.ptr
+	c.mu.Unlock()
+	C.ob_auth_manager_cancel(C.ob_api_client_auth_manager(ptr))
+	c.mu.Lock()
+	for c.requests != 0 {
+		c.cond.Wait()
+	}
+	c.mu.Unlock()
+	// Storage callbacks must finish outside the client lock before their cgo
+	// handle is released; the native destructor cancels and joins its worker.
+	C.ob_api_client_destroy(ptr)
+	c.mu.Lock()
+	if c.authHandle != 0 {
+		c.authHandle.Delete()
+		c.authHandle = 0
+	}
 	c.ptr = nil
+	c.closing = false
+	c.cond.Broadcast()
+	c.mu.Unlock()
 	return nil
+}
+func (c *Client) beginRequest() (*C.ob_api_client, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ptr == nil || c.closing {
+		return nil, errors.New("remote: client closed")
+	}
+	c.requests++
+	return c.ptr, nil
+}
+func (c *Client) endRequest() {
+	c.mu.Lock()
+	c.requests--
+	c.cond.Broadcast()
+	c.mu.Unlock()
 }
 func (c *Client) retain() (*C.ob_api_client, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if c.ptr == nil {
+	if c.ptr == nil || c.closing {
 		return nil, errors.New("remote: client closed")
 	}
 	c.refs.Add(1)
@@ -137,21 +183,21 @@ func (c *Client) Request(method, path string, bearer *string, body any) (json.Ra
 		ct = C.CString(*bearer)
 		defer C.free(unsafe.Pointer(ct))
 	}
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if c.ptr == nil {
-		return nil, errors.New("remote: client closed")
+	ptr, err := c.beginRequest()
+	if err != nil {
+		return nil, err
 	}
+	defer c.endRequest()
 	var response *C.char
 	var diag C.ob_api_error
-	rc := C.ob_api_request(c.ptr, cm, cp, ct, cb, &response, &diag)
+	rc := C.ob_api_request(ptr, cm, cp, ct, cb, &response, &diag)
 	var result json.RawMessage
 	if response != nil {
 		result = json.RawMessage(C.GoString(response))
 		C.ob_api_response_free(response)
 	}
 	if rc != 0 {
-		return result, apiError(&diag)
+		return result, c.authError(&diag)
 	}
 	return result, nil
 }
@@ -277,15 +323,17 @@ func connectionInfo(info C.ob_remote_connection_info) ConnectionInfo {
 }
 
 type Server struct {
-	mu     sync.Mutex
-	ptr    *C.ob_remote_server
-	client *Client
+	mu        sync.Mutex
+	ptr       *C.ob_remote_server
+	client    *Client
+	closeDone chan struct{}
 }
 type Peer struct {
-	mu     sync.Mutex
-	ptr    *C.ob_remote_peer
-	client *Client
-	maps   map[*Mapping]struct{}
+	mu        sync.Mutex
+	ptr       *C.ob_remote_peer
+	client    *Client
+	maps      map[*Mapping]struct{}
+	closeDone chan struct{}
 }
 type Mapping struct {
 	ptr  *C.ob_remote_map
@@ -431,12 +479,24 @@ func (s *Server) Reconnect() error {
 
 func (s *Server) Close() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.ptr != nil {
-		C.ob_remote_server_close(s.ptr)
-		s.ptr = nil
-		s.client.refs.Add(-1)
+	if s.ptr == nil {
+		done := s.closeDone
+		s.mu.Unlock()
+		if done != nil {
+			<-done
+		}
+		return
 	}
+	ptr := s.ptr
+	s.ptr = nil
+	s.closeDone = make(chan struct{})
+	done := s.closeDone
+	s.mu.Unlock()
+	// Native close may perform account RPCs/storage callbacks; no Go handle
+	// lock remains held while its worker and borrowed API use are joined.
+	C.ob_remote_server_close(ptr)
+	s.client.refs.Add(-1)
+	close(done)
 }
 func (c *Client) Connect(brokerID, password string, options ConnectOptions) (*Peer, error) {
 	return c.connect(brokerID, password, options, false)
@@ -598,16 +658,29 @@ func (m *Mapping) Close() {
 }
 func (p *Peer) Close() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.ptr == nil {
+		done := p.closeDone
+		p.mu.Unlock()
+		if done != nil {
+			<-done
+		}
 		return
 	}
+	ptr := p.ptr
+	p.ptr = nil
+	p.closeDone = make(chan struct{})
+	done := p.closeDone
+	maps := make([]*C.ob_remote_map, 0, len(p.maps))
 	for m := range p.maps {
-		C.ob_remote_map_close(m.ptr)
+		maps = append(maps, m.ptr)
 		m.ptr = nil
 		delete(p.maps, m)
 	}
-	C.ob_remote_peer_close(p.ptr)
-	p.ptr = nil
+	p.mu.Unlock()
+	for _, mapping := range maps {
+		C.ob_remote_map_close(mapping)
+	}
+	C.ob_remote_peer_close(ptr)
 	p.client.refs.Add(-1)
+	close(done)
 }

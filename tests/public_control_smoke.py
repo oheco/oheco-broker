@@ -108,7 +108,7 @@ def main():
     def request(method, path):
         # Keep the bearer off argv and out of diagnostics.
         config = "header = " + json.dumps("Authorization: Bearer " + token) + "\n"
-        result = subprocess.run(["curl", "--proxy", args.proxy, "--cacert", args.ca_file,
+        result = subprocess.run(["curl", "--disable", "--noproxy", "", "--proxy", args.proxy, "--cacert", args.ca_file,
                                  "--silent", "--show-error", "--fail-with-body", "--max-time", "15",
                                  "--request", method, "--config", "-", args.api.rstrip("/") + path],
                                 input=config, capture_output=True, text=True, timeout=20)

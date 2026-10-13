@@ -33,7 +33,7 @@ import time
 import xml.etree.ElementTree as ET
 
 
-RELEASE_VERSION = "0.5.0"
+RELEASE_VERSION = "0.5.1"
 ROOT_NAME = f"oheco-broker-{RELEASE_VERSION}-ohos-arm64"
 VERSION = f"oheco-broker {RELEASE_VERSION}\n".encode("ascii")
 PROXY = "socks5h://127.0.0.1:10808"

@@ -1,6 +1,6 @@
 # 远程连接恢复
 
-C SDK 的重连管理器保留逻辑 peer、映射句柄和本地监听端口，为每次网络尝试重新建立控制会话、ICE/TURN、QUIC 和认证。Go SDK 调用同一个 C 引擎；CLI 不另建重连状态机。
+C SDK 的重连管理器保留逻辑 peer、映射句柄和本地监听端口，为每次网络尝试重新建立控制会话、ICE/TURN、QUIC 和认证。Go SDK 调用同一个 C 引擎；CLI 的每轮网络恢复由该引擎完成，`tenant serve` 在轮次耗尽后定时唤醒同一个 server 句柄。
 
 ## 默认策略与状态
 
@@ -82,7 +82,9 @@ if err == nil && info.State == remote.StatePaused {
 
 `tenant serve` 和 `tenant connect` 在重连、退避及暂停时继续运行，保留同一个 SDK 句柄。`tenant connect` 仍同步完成首次连接，然后输出原有 `mapping_ready`；`tenant serve` 保留原有 `broker_ready` 事件。首次同步启动失败仍返回错误，需要处理首次失败的嵌入式应用应使用异步 SDK 接口。
 
-增加 `--state-events` 可在 stdout 输出 JSON 恢复事件，默认关闭，保持原有 ready JSON 消费方式：
+从 0.5.1 开始，`tenant serve` 在一次自动恢复轮次进入 `paused` 后等待 30 秒，调用现有 `Reconnect` 开始下一轮。轮次持续进行，直到连接恢复、用户停止或遇到终止授权错误；沿用同一个 server 句柄和设备凭据。`tenant connect` 与 SDK 的暂停状态继续由调用方手动唤醒。`SIGUSR1` 可以提前唤醒 serve 的等待，与已经接受但尚未观测到新轮次的自动请求合并。等待使用命令的取消上下文，`SIGINT`／`SIGTERM` 无需等满 30 秒。
+
+serve 在进入暂停及恢复为在线时默认向 stderr 输出提示，每次状态变化一次。stdout 默认仍只输出初次 `broker_ready`。增加 `--state-events` 可在 stdout 输出 JSON 恢复事件，默认关闭，保持原有 ready JSON 消费方式；自动唤醒的 `reconnect_requested` 额外包含 `automatic: true`，手动请求保留原格式：
 
 ```sh
 oheco-broker tenant serve --name example --allow tcp@127.0.0.1:8080 \

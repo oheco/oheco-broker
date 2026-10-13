@@ -599,7 +599,7 @@ def main():
         root = Path(directory)
         version_env = dict(os.environ, TMPDIR=str(root), XDG_CONFIG_HOME=str(root / "version-config"))
         version_env.pop("LD_PRELOAD", None)
-        for binary, expected in ((args.old_binary, "0.3.0"), (args.new_binary, "0.5.0")):
+        for binary, expected in ((args.old_binary, "0.3.0"), (args.new_binary, "0.5.1")):
             result = subprocess.run([binary, "--version"], env=version_env, cwd=root, stdin=subprocess.DEVNULL,
                                     capture_output=True, text=True, timeout=args.ready_timeout)
             require(result.returncode == 0 and result.stdout.strip() == "oheco-broker " + expected,
@@ -617,7 +617,7 @@ def main():
     require(digest(__file__) == test_source_sha256, "test source changed during acceptance")
     print("PASS " + json.dumps({"event": "peer_v1_compat_complete", "platform": platform.platform(),
           "native_signed_execution_on_harmonyos": platform.system() == "HarmonyOS",
-          "old_version": "0.3.0", "new_version": "0.5.0", "artifacts": artifacts,
+          "old_version": "0.3.0", "new_version": "0.5.1", "artifacts": artifacts,
           "directions": len(results), "resources_cleaned": True,
           "test_source_sha256": test_source_sha256, "artifacts_unchanged": True,
           "scope": "healthy native v1 fallback; transport outage is a separate acceptance gate"},

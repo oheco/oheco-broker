@@ -43,6 +43,7 @@ done
 "$OB_REMOTE_TEST"
 python3 "$root/tests/auth_refresh.py" --cli "$priv/oheco-broker" --fixture "$priv/control-fixture" --native-auth "$OB_AUTH_TEST"
 python3 "$root/tests/cli_control.py" "$priv/oheco-broker"
+python3 "$root/tests/cli_serve_recovery.py" --binary "$priv/oheco-broker"
 python3 "$root/tests/remote_acceptance.py" --fixture "$priv/control-fixture" \
     --native "$OB_REMOTE_TEST" --api-test "$priv/remote-api-test" --binary "$priv/oheco-broker"
 python3 "$root/tests/peer_lifecycle.py" --fixture "$priv/control-fixture" --binary "$priv/oheco-broker"

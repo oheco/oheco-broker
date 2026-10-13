@@ -498,7 +498,7 @@ func serveCommand(o *rootOptions) *cobra.Command {
 		}
 		defer server.Close()
 		_ = json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]any{"event": "broker_ready", "broker_id": server.ID(), "name": name, "allow_rules": len(rules)})
-		return monitorPeer(cmd, server, "broker", stateEvents, requests)
+		return monitorPeer(cmd, server, peerMonitorOptions{kind: "broker", stateEvents: stateEvents, pausedRetryInterval: brokerPausedRetryInterval}, requests)
 	}}
 	cmd.Flags().StringVar(&name, "name", "", "Unique broker name within your tenant")
 	cmd.Flags().StringVar(&password, "password", "", "Private peer password; never sent to management API")
@@ -594,7 +594,7 @@ func connectCommand(o *rootOptions) *cobra.Command {
 		}
 		defer mapping.Close()
 		_ = json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]any{"event": "mapping_ready", "protocol": protocol, "local": net.JoinHostPort(localHost, strconv.Itoa(int(mapping.Port()))), "broker_id": id, "target": target, "relay_mode": relay})
-		return monitorPeer(cmd, peer, "peer", stateEvents, requests)
+		return monitorPeer(cmd, peer, peerMonitorOptions{kind: "peer", stateEvents: stateEvents}, requests)
 	}}
 	f := cmd.Flags()
 	f.StringVar(&name, "name", "", "Broker name")

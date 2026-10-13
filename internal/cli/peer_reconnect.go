@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -12,10 +13,18 @@ import (
 	"github.com/spf13/cobra"
 )
 
+const brokerPausedRetryInterval = 30 * time.Second
+
 type reconnectHandle interface {
 	Status() error
 	GetConnectionInfo() (remote.ConnectionInfo, error)
 	Reconnect() error
+}
+
+type peerMonitorOptions struct {
+	kind                string
+	stateEvents         bool
+	pausedRetryInterval time.Duration // Zero preserves manual-only paused recovery.
 }
 
 func peerReconnectSignals() (<-chan os.Signal, func()) {
@@ -48,46 +57,70 @@ func printConnectionState(cmd *cobra.Command, kind string, info remote.Connectio
 	return json.NewEncoder(cmd.OutOrStdout()).Encode(event)
 }
 
-// The native manager owns every retry. The foreground command keeps the same
-// handle and mapping alive while reconnecting or paused; SIGUSR1 only wakes it.
-func monitorPeer(cmd *cobra.Command, handle reconnectHandle, kind string, stateEvents bool, requests <-chan os.Signal) error {
+// The native manager owns each bounded retry round. A long-running serve command
+// starts another round after a paused interval without replacing its SDK handle.
+func monitorPeer(cmd *cobra.Command, handle reconnectHandle, options peerMonitorOptions, requests <-chan os.Signal) error {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	return monitorPeerTicks(cmd, handle, options, requests, ticker.C)
+}
+
+func monitorPeerTicks(cmd *cobra.Command, handle reconnectHandle, options peerMonitorOptions, requests <-chan os.Signal, ticks <-chan time.Time) error {
 	last, err := handle.GetConnectionInfo()
 	if err != nil {
 		return err
 	}
-	if stateEvents {
-		if err = printConnectionState(cmd, kind, last); err != nil {
+	if options.stateEvents {
+		if err = printConnectionState(cmd, options.kind, last); err != nil {
 			return err
 		}
 	}
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
+	roundRequested := false
+	requestReconnect := func(automatic bool) error {
+		// Merge serve requests until a poll observes the native worker leave
+		// paused. A signal racing the automatic deadline must not reset the
+		// just-started round's retry budget a second time.
+		if options.pausedRetryInterval == 0 || !roundRequested {
+			if err := handle.Reconnect(); err != nil {
+				return err
+			}
+			roundRequested = options.pausedRetryInterval > 0
+		}
+		if !options.stateEvents {
+			return nil
+		}
+		event := map[string]any{"event": "reconnect_requested", "handle": options.kind, "accepted": true}
+		if automatic {
+			event["automatic"] = true
+		}
+		return json.NewEncoder(cmd.OutOrStdout()).Encode(event)
+	}
+	var nextPausedRetry time.Time
+	outageReported := false
 	for {
 		select {
 		case <-cmd.Context().Done():
 			return nil
 		case <-requests:
-			if err = handle.Reconnect(); err != nil {
+			alreadyRequested := roundRequested
+			if err = requestReconnect(false); err != nil {
 				return err
 			}
-			if stateEvents {
-				if err = json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]any{
-					"event": "reconnect_requested", "handle": kind, "accepted": true,
-				}); err != nil {
-					return err
-				}
+			// A new manual request supersedes the scheduled round. A merged
+			// request keeps the existing deadline rather than postponing it.
+			if !alreadyRequested {
+				nextPausedRetry = time.Time{}
 			}
-		case <-ticker.C:
+		case now := <-ticks:
 			info, e := handle.GetConnectionInfo()
 			if e != nil {
 				return e
 			}
-			if stateEvents && connectionInfoChanged(last, info) {
-				if e = printConnectionState(cmd, kind, info); e != nil {
+			if options.stateEvents && connectionInfoChanged(last, info) {
+				if e = printConnectionState(cmd, options.kind, info); e != nil {
 					return e
 				}
 			}
-			last = info
 			switch info.State {
 			case remote.StateFailed, remote.StateClosed:
 				if e = handle.Status(); e != nil {
@@ -102,6 +135,35 @@ func monitorPeer(cmd *cobra.Command, handle reconnectHandle, kind string, stateE
 					return e
 				}
 			}
+			if options.pausedRetryInterval > 0 && info.State == remote.StatePaused {
+				if nextPausedRetry.IsZero() {
+					nextPausedRetry = now.Add(options.pausedRetryInterval)
+					if last.State != remote.StatePaused || !outageReported {
+						if _, e = fmt.Fprintf(cmd.ErrOrStderr(), "Broker control connection lost; automatic retries exhausted. Retrying in %s.\n", options.pausedRetryInterval); e != nil {
+							return e
+						}
+						outageReported = true
+					}
+				} else if !now.Before(nextPausedRetry) {
+					roundRequested = false
+					if e = requestReconnect(true); e != nil {
+						return e
+					}
+					// Reconnect is asynchronous; do not issue another request on
+					// every tick while the native worker still reports paused.
+					nextPausedRetry = now.Add(options.pausedRetryInterval)
+				}
+			} else {
+				nextPausedRetry = time.Time{}
+				roundRequested = false
+				if outageReported && info.State == remote.StateConnected {
+					if _, e = fmt.Fprintln(cmd.ErrOrStderr(), "Broker control connection restored."); e != nil {
+						return e
+					}
+					outageReported = false
+				}
+			}
+			last = info
 		}
 	}
 }

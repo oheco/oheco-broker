@@ -1,4 +1,4 @@
-# Go source SDK — 0.5.0
+# Go source SDK — 0.5.1
 
 Import `github.com/oheco/oheco-broker/sdk/go/remote` for management, authenticated peers and TCP/UDP mappings. The package wraps the same C engine through cgo; it does not implement another ICE/TURN/QUIC or cryptographic stack. This is source distribution, without a prebuilt Go or C SDK library.
 
@@ -11,6 +11,8 @@ sh sdk/c/build.sh
 . "$XDG_CACHE_HOME/oheco-broker/remote-sdk/remote.env"
 go build -a -mod=vendor ./sdk/go/remote
 ```
+
+On HarmonyOS SDKs with pre-signed CRT objects, wrap C builds and Go consumer builds with `python3 -B sdk/c/build/native-toolchain.py -- COMMAND ...`. The helper uses private temporary compiler/signing wrappers, discards old input signature sections and performs final signing without changing the installed SDK. Its source is included in this SDK distribution.
 
 `remote.env` supplies `CGO_ENABLED`, include paths, static archive link flags, C++ runtime and offline Go proxy settings. With `sdk/c/build.sh --build-dir ABSOLUTE_PATH`, source that build root's `remote-sdk/remote.env` instead. Build on the actual target platform; the host needs its C/C++ runtimes even though the peer dependencies are static. The packaged CLI's private runtime does not automatically configure your application.
 

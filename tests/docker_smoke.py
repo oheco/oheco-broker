@@ -521,7 +521,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", required=True)
     parser.add_argument("--expected-arch", choices=("amd64", "arm64"), required=True)
-    parser.add_argument("--expected-version", default="0.5.0")
+    parser.add_argument("--expected-version", default="0.5.1")
     parser.add_argument("--expected-revision", required=True)
     args = parser.parse_args()
     require(platform.system() == "Linux" and architecture(platform.machine()) == args.expected_arch,

@@ -1,4 +1,4 @@
-# C source SDK — 0.3.0
+# C source SDK — 0.5.1
 
 This source SDK has two independent entry points:
 
@@ -14,7 +14,7 @@ This source SDK has two independent entry points:
   builders and probes in `build/`. It uses TLS/WS/WSS and has C++ runtime
   requirements; the local SDK's no-dependency statement does not apply to it.
 
-The 0.3.0 package distributes **source SDKs, not prebuilt SDK libraries**. Build
+The package distributes **source SDKs, not prebuilt SDK libraries**. Build
 remote inputs natively with installed C/C++ compilers, CMake, Ninja and Python;
 HarmonyOS also needs `binary-sign-tool`. From the package or checkout root:
 
@@ -22,6 +22,12 @@ HarmonyOS also needs `binary-sign-tool`. From the package or checkout root:
 sh sdk/c/build.sh
 . "$XDG_CACHE_HOME/oheco-broker/remote-sdk/remote.env"
 ```
+
+If the HarmonyOS SDK's CRT objects already contain signature sections, use
+`python3 -B sdk/c/build/native-toolchain.py -- sh sdk/c/build.sh`. This helper
+isolates the linker/signing setup in a private temporary directory and preserves
+final executable signing without changing the installed SDK. Use the same helper
+around a consumer build when its compiler uses those CRT inputs.
 
 The builder is offline and generates static archives plus consumer include/link
 settings in a private cache. Use `--build-dir ABSOLUTE_PATH` for another build

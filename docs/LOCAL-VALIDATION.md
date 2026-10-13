@@ -1,5 +1,15 @@
 # 原生验收索引
 
+## 0.5.1 broker 持续恢复
+
+2026-10-14 在 HarmonyOS arm64、原生 Go 1.27.1 上执行新的 `tests/cli_serve_recovery.py`：真实原生重试耗尽后，同一个 serve 进程在网络恢复后约 31 秒自动恢复；未发送恢复信号、未重启进程。短 TTL 账户刷新、原设备 token 摘要及 login session 保持、默认 stderr 提示与 stdout 初次 ready JSON、新建 TCP 映射、显式撤销退出和 TERM 退出均通过。
+
+Go monitor 测试覆盖多次暂停轮次、两种自动／手动请求先后顺序、暂停期间取消、connect 继续手动恢复，以及 failed/closed 时保留终止授权错误。上述新 TCP 映射验收不等于跨长时间故障保留旧 socket；旧流期限由原生恢复套件独立验证。
+
+独立真实 HTTPS/WSS 管理源冒烟 `tests/public_control_smoke.py` 通过：原生重试耗尽后约 30.99 秒自动恢复，TLS 仍校验真实 API 地址；使用签名的测试 socket 转发层与 SOCKS5 代理，未修改已有账户配置，唯一临时 broker 已删除。该冒烟覆盖公网控制连接，不代表已重新完成公网 direct/TURN TCP/UDP 数据面验收。
+
+新测试已接入 `scripts/test-remote.sh` 及 Linux Docker 构建。构建环境中 SDK CRT 对象携带的 `.codesign` 段通过 `sdk/c/build/native-toolchain.py` 在私有链接／签名配置中处理，最终签名仍实际执行；安装的 SDK 和签名配置保持完整。完整发行门槛和最终归档证据以本次发行验证附件为准，不将以下历史记录当作新产物的验证。
+
 ## 0.5.0 账户自动刷新
 
 刷新验收通过 `scripts/test-remote.sh` 集成：真实 SQLite/Pion fixture、签名 CLI/C SDK、短期限 access/refresh、持续 TCP/UDP 与实际 TURN 计量；可独立运行 `tests/auth_refresh.py` 并用 `--native-auth` 选择独立 C 客户端。验收覆盖原 socket/FD、监听和逻辑代数保持、零账户 HTTP 的空闲刷新、六进程单个提交、过期 access 恢复、回包丢失、进程重启、不安全 journal 拒绝与显式撤销。
